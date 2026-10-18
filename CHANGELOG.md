@@ -6,6 +6,14 @@ All notable changes to `@samfp/pi-memory`. Versions follow [semver](https://semv
 
 Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 
+### Added
+
+- **`memory.consolidationThinking`** — thinking level for the consolidation
+  subprocess (`pi --thinking`). Unset, the child inherited the global
+  `defaultThinkingLevel` (xhigh in one real config) for what is a JSON
+  extraction job, which also changed the key style the model produced
+  (`editor_preference` instead of a dotted `pref.*` key).
+
 ### Fixed
 
 - **Consolidation prompts pair each question with its own answer.** The two

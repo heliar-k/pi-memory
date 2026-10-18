@@ -25,6 +25,9 @@ export interface ContextBlock {
  */
 export type LessonInjectionMode = "all" | "selective";
 
+export const CONSOLIDATION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"] as const;
+export type ConsolidationThinking = (typeof CONSOLIDATION_THINKING_LEVELS)[number];
+
 export interface InjectorConfig {
   lessonInjection?: LessonInjectionMode;
   /**
@@ -83,6 +86,15 @@ export interface InjectorConfig {
    * case is that consolidation skips this session.
    */
   consolidationModel?: string;
+  /**
+   * Thinking level for the consolidation subprocess (`pi --thinking`).
+   *
+   * Without it the child inherits the global `defaultThinkingLevel`, which is
+   * often tuned for the main agent (xhigh in one real config) — an odd fit for
+   * extracting JSON, and it changes the key style the model produces.
+   * Absent means "inherit", which is the upstream behaviour.
+   */
+  consolidationThinking?: ConsolidationThinking;
 }
 
 /**

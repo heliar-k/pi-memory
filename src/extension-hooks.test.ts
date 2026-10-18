@@ -237,6 +237,30 @@ describe("consolidation off the interaction path", () => {
     throw new Error("background drain did not finish");
   }
 
+  it("passes the configured thinking level to the consolidation subprocess", async () => {
+    const h = createHarness({ consolidationModel: "test/model", consolidationThinking: "low" });
+    try {
+      await h.handlers.get("session_start")!({}, h.ctx);
+      await h.handlers.get("agent_end")!(
+        {
+          messages: ["one", "two", "three"].flatMap((n) => [
+            { role: "user", content: `remember preference ${n}` },
+            { role: "assistant", content: "ok" },
+          ]),
+        },
+        h.ctx,
+      );
+      await h.handlers.get("session_before_switch")!({}, h.ctx);
+      await h.handlers.get("agent_settled")!({}, h.ctx);
+      await waitForDrain(h);
+
+      const args = h.execCalls[0]![1] as string[];
+      assert.equal(args[args.indexOf("--thinking") + 1], "low");
+    } finally {
+      await h.cleanup();
+    }
+  });
+
   it("retries a failed consolidation, then drops it", async () => {
     const h = createHarness({ consolidationModel: "test/model" });
     const dbPath = path.join(h.project, "memory", "memory.db");

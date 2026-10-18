@@ -595,6 +595,7 @@ import os from "node:os";
 var MAX_CONTEXT_CHARS = 8e3;
 var SEARCH_LIMIT = 15;
 var LESSON_SEARCH_LIMIT = 15;
+var CONSOLIDATION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
 async function buildContextBlock(store, cwd, prompt, config) {
   if (prompt?.trim()) {
     return buildSelectiveBlock(store, prompt, cwd, config);
@@ -1375,7 +1376,7 @@ function warnUnknownKeys(block, blockName, knownKeys) {
     `pi-memory: ignoring unknown key(s) in settings.json "${blockName}" block: ${unknown.join(", ")} (expected: ${knownKeys.join(", ")})`
   );
 }
-var PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection", "injectionMode", "embedding"];
+var PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "consolidationThinking", "perTurnInjection", "injectionMode", "embedding"];
 var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveDbPath(cwd) {
   try {
@@ -1410,6 +1411,9 @@ function mergeMemorySettings(config, memorySettings) {
   }
   if (typeof m.consolidationModel === "string" && m.consolidationModel.trim()) {
     config.consolidationModel = m.consolidationModel.trim();
+  }
+  if (typeof m.consolidationThinking === "string" && CONSOLIDATION_THINKING_LEVELS.includes(m.consolidationThinking)) {
+    config.consolidationThinking = m.consolidationThinking;
   }
   config.embedding = parseEmbeddingSettings(m.embedding) ?? config.embedding;
 }
@@ -1812,7 +1816,10 @@ ${text}` };
         "--no-tools",
         "--no-session",
         "--model",
-        injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL
+        injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+        // Left unset, the child inherits the global defaultThinkingLevel; see
+        // InjectorConfig.consolidationThinking.
+        ...injectorConfig.consolidationThinking ? ["--thinking", injectorConfig.consolidationThinking] : []
       ], {
         timeout: EXEC_TIMEOUT_MS,
         cwd: input.cwd ?? sessionCwd

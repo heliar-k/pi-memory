@@ -24,7 +24,7 @@ import { homedir } from "node:os";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MemoryStore, type SemanticEntry } from "./store.js";
-import { buildContextBlock, projectSlug, type InjectorConfig } from "./injector.js";
+import { buildContextBlock, projectSlug, CONSOLIDATION_THINKING_LEVELS, type ConsolidationThinking, type InjectorConfig } from "./injector.js";
 import {
   createEmbedder,
   diagnoseEmbedderError,
@@ -140,7 +140,7 @@ function warnUnknownKeys(block: unknown, blockName: string, knownKeys: readonly 
   );
 }
 
-const PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "perTurnInjection", "injectionMode", "embedding"] as const;
+const PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel", "consolidationThinking", "perTurnInjection", "injectionMode", "embedding"] as const;
 const PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"] as const;
 
 export function resolveDbPath(cwd: string): string {
@@ -193,6 +193,9 @@ function mergeMemorySettings(config: InjectorConfig, memorySettings: unknown): v
   }
   if (typeof m.consolidationModel === "string" && m.consolidationModel.trim()) {
     config.consolidationModel = m.consolidationModel.trim();
+  }
+  if (typeof m.consolidationThinking === "string" && (CONSOLIDATION_THINKING_LEVELS as readonly string[]).includes(m.consolidationThinking)) {
+    config.consolidationThinking = m.consolidationThinking as ConsolidationThinking;
   }
   config.embedding = parseEmbeddingSettings(m.embedding) ?? config.embedding;
 }
@@ -851,6 +854,9 @@ export default function (pi: ExtensionAPI) {
         "--no-tools",
         "--no-session",
         "--model", injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
+        // Left unset, the child inherits the global defaultThinkingLevel; see
+        // InjectorConfig.consolidationThinking.
+        ...(injectorConfig.consolidationThinking ? ["--thinking", injectorConfig.consolidationThinking] : []),
       ], {
         timeout: EXEC_TIMEOUT_MS,
         cwd: input.cwd ?? sessionCwd,

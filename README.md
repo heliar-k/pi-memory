@@ -135,6 +135,7 @@ The result is capped at 15 most relevant lessons instead of all of them.
   "memory": {
     "lessonInjection": "selective",
     "consolidationModel": "openai/gpt-4.1-mini"
+    "consolidationThinking": "low"
   }
 }
 ```
