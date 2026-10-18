@@ -48,6 +48,7 @@ var MemoryStore = class {
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
@@ -123,8 +124,22 @@ var MemoryStore = class {
           INSERT INTO lessons_fts(rowid, rule, category) VALUES (new.rowid, new.rule, new.category);
         END;
       `);
-      this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
-      this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
+      let ftsInSync = false;
+      try {
+        const guard = this.db.prepare(
+          `SELECT (SELECT COUNT(*) FROM semantic) = (SELECT COUNT(*) FROM semantic_fts_docsize)
+                AND (SELECT COUNT(*) FROM lessons) = (SELECT COUNT(*) FROM lessons_fts_docsize) AS ok`
+        ).get();
+        ftsInSync = !!guard && guard.ok === 1;
+      } catch {
+        ftsInSync = false;
+      }
+      if (!ftsInSync) {
+        this.db.exec("BEGIN");
+        this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
+        this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
+        this.db.exec("COMMIT");
+      }
       this.hasFTS5 = true;
     } catch {
       this.hasFTS5 = false;
