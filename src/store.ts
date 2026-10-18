@@ -92,6 +92,9 @@ export class MemoryStore {
     // random commit — measured as a 1.3 s stall in the middle of a session —
     // instead of here. 128 pages ≈ 512 KB.
     this.db.exec("PRAGMA wal_autocheckpoint = 128");
+    // ...and give the file back once it is checkpointed, instead of keeping a
+    // multi-megabyte -wal around from earlier runs.
+    this.db.exec("PRAGMA journal_size_limit = 1048576");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
