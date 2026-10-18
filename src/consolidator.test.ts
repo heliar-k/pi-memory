@@ -35,6 +35,39 @@ describe("buildConsolidationPrompt", () => {
     assert.ok(userCount <= 30);
   });
 
+  it("pairs each user message with its own turn's answer", () => {
+    // The legacy arrays drift: assistant messages include every tool step, so
+    // index pairing puts turn 0's chatter next to turn 2's question.
+    const prompt = buildConsolidationPrompt({
+      userMessages: ["first question", "second question"],
+      assistantMessages: ["tool preamble one", "tool preamble two", "final answer two"],
+      turns: [
+        { user: "first question", assistant: "final answer one" },
+        { user: "second question", assistant: "final answer two" },
+      ],
+    });
+    assert.match(prompt, /User: first question\n\nAssistant: final answer one/);
+    assert.match(prompt, /User: second question\n\nAssistant: final answer two/);
+    assert.ok(!prompt.includes("tool preamble"));
+  });
+
+  it("keeps the newest turns when there are more than 30", () => {
+    const turns = Array.from({ length: 40 }, (_, i) => ({ user: `q${i}`, assistant: `a${i}` }));
+    const prompt = buildConsolidationPrompt({ userMessages: [], assistantMessages: [], turns });
+    assert.ok(!prompt.includes("User: q9"), "oldest turns must be dropped");
+    assert.ok(prompt.includes("User: q10"));
+    assert.ok(prompt.includes("User: q39"));
+    assert.equal((prompt.match(/User: q/g) || []).length, 30);
+  });
+
+  it("falls back to index pairing for payloads queued before turns existed", () => {
+    const prompt = buildConsolidationPrompt({
+      userMessages: ["old question"],
+      assistantMessages: ["old answer"],
+    });
+    assert.match(prompt, /User: old question\n\nAssistant: old answer/);
+  });
+
   it("includes current facts in prompt", () => {
     const prompt = buildConsolidationPrompt(
       { userMessages: ["hello"], assistantMessages: ["hi"] },

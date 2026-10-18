@@ -15,6 +15,7 @@ const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), "pi-memory-home-"));
 process.env.HOME = fakeHome;
 process.env.USERPROFILE = fakeHome;
 const { default: piMemory } = await import("./index.js");
+const { MemoryStore } = await import("./store.js");
 
 type Api = Parameters<typeof piMemory>[0];
 type Handler = (event: unknown, ctx: unknown) => unknown;
@@ -34,6 +35,7 @@ function createHarness(memorySettings: Record<string, unknown>) {
   const statuses: string[] = [];
   const sent: { customType?: string; content?: string }[] = [];
   const execCalls: unknown[][] = [];
+  const exec = { code: 0 };
   const pi = {
     on: (name: string, h: Handler) => void handlers.set(name, h),
     registerTool: (t: Tool & { name: string }) => void tools.set(t.name, t),
@@ -41,6 +43,7 @@ function createHarness(memorySettings: Record<string, unknown>) {
     sendMessage: (m: { customType?: string; content?: string }) => void sent.push(m),
     exec: async (...args: unknown[]) => {
       execCalls.push(args);
+      if (exec.code !== 0) return { code: exec.code, stdout: "" };
       return { code: 0, stdout: '{"semantic":[],"lessons":[]}' };
     },
   };
@@ -63,11 +66,14 @@ function createHarness(memorySettings: Record<string, unknown>) {
 
   return {
     ctx,
+    project,
     handlers,
     notifications,
     statuses,
     sent,
     execCalls,
+    /** Force the consolidation subprocess to fail, or restore it. */
+    setExecCode: (code: number) => { exec.code = code; },
     call,
     async cleanup() {
       await handlers.get("session_shutdown")?.({}, ctx);
@@ -230,6 +236,49 @@ describe("consolidation off the interaction path", () => {
     }
     throw new Error("background drain did not finish");
   }
+
+  it("retries a failed consolidation, then drops it", async () => {
+    const h = createHarness({ consolidationModel: "test/model" });
+    const dbPath = path.join(h.project, "memory", "memory.db");
+    const pending = () => {
+      const store = new MemoryStore(dbPath);
+      try {
+        return store.pendingCount();
+      } finally {
+        store.close();
+      }
+    };
+    const waitFor = async (predicate: () => boolean, label: string) => {
+      for (let i = 0; i < 300; i++) {
+        if (predicate()) return;
+        await new Promise((r) => setTimeout(r, 10));
+      }
+      throw new Error(`timed out waiting for ${label}`);
+    };
+
+    try {
+      h.setExecCode(1); // provider or model failure
+      await h.handlers.get("session_start")!({}, h.ctx);
+      await h.handlers.get("agent_end")!(
+        {
+          messages: ["one", "two", "three"].flatMap((n) => [
+            { role: "user", content: `remember preference ${n}` },
+            { role: "assistant", content: "ok" },
+          ]),
+        },
+        h.ctx,
+      );
+
+      for (const attempt of [1, 2, 3]) {
+        await h.handlers.get("agent_settled")!({}, h.ctx);
+        await waitFor(() => h.execCalls.length === attempt, `attempt ${attempt}`);
+        await waitFor(() => pending() === (attempt < 3 ? 1 : 0), `queue after attempt ${attempt}`);
+        assert.equal(pending(), attempt < 3 ? 1 : 0, `queue after attempt ${attempt}`);
+      }
+    } finally {
+      await h.cleanup();
+    }
+  });
 
   it("a session switch queues the tail; the next idle moment drains it", async () => {
     const h = createHarness({ consolidationModel: "test/model" });

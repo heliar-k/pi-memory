@@ -81,6 +81,7 @@ import {
   parseConsolidationResponse,
   applyExtracted,
   type ConsolidationInput,
+  type ConversationTurn,
   type ExtractedMemory,
 } from "./consolidator.js";
 
@@ -103,6 +104,15 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
  * users — overridable via `memory.consolidationModel` (global or project).
  */
 export const DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
+
+/** Give up on a queued tail after this many failed consolidation attempts. */
+const MAX_CONSOLIDATION_ATTEMPTS = 3;
+
+/**
+ * Busy timeout for background writes. Short on purpose: losing the lock means
+ * "retry later", while blocking this process's event loop would freeze the TUI.
+ */
+const DB_YIELD_MS = 250;
 
 /**
  * Resolve the memory DB path for a given working directory.
@@ -268,8 +278,8 @@ export function readSettingsConfig(cwd?: string): InjectorConfig {
 
 export default function (pi: ExtensionAPI) {
   let store: MemoryStore | null = null;
-  let pendingUserMessages: string[] = [];
-  let pendingAssistantMessages: string[] = [];
+  // One entry per user turn — the unit the consolidation prompt is built from.
+  let pendingTurns: ConversationTurn[] = [];
   let sessionCwd: string = "";
   let sessionId: string | undefined;
   let cachedCtx: any = null;
@@ -467,24 +477,17 @@ export default function (pi: ExtensionAPI) {
       // only wanted one answer. Vectors only improve `memory_search`.
       if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
 
-      // Seed pending messages from existing session history so that
+      // Seed the turn buffer from existing session history so that
       // /memory-consolidate works even when resuming a session (the
       // historical messages never fire agent_end).  See #5.
-      pendingUserMessages = [];
-      pendingAssistantMessages = [];
+      pendingTurns = [];
       try {
         const branch = ctx.sessionManager.getBranch();
         for (const entry of branch) {
           if (entry.type !== "message") continue;
           const msg = (entry as any).message;
           if (!msg) continue;
-          if (msg.role === "user") {
-            const text = extractText(msg.content);
-            if (text) pendingUserMessages.push(text);
-          } else if (msg.role === "assistant") {
-            const text = extractText(msg.content);
-            if (text) pendingAssistantMessages.push(text);
-          }
+          recordTurn(msg.role, extractText(msg.content));
         }
       } catch {
         // Session may not have entries yet (brand-new session)
@@ -634,21 +637,10 @@ export default function (pi: ExtensionAPI) {
 
 
   pi.on("agent_end", async (event, _ctx) => {
-    // Collect messages for consolidation at shutdown
+    // Buffer this run for consolidation, keeping the turn structure intact.
     for (const msg of event.messages) {
-      if (msg.role === "user" && "content" in msg) {
-        const text = extractText(msg.content);
-        if (text) {
-          pendingUserMessages.push(text);
-          if (pendingUserMessages.length > 60) pendingUserMessages.shift();
-        }
-      } else if (msg.role === "assistant" && "content" in msg) {
-        const text = extractText(msg.content);
-        if (text) {
-          pendingAssistantMessages.push(text);
-          if (pendingAssistantMessages.length > 60) pendingAssistantMessages.shift();
-        }
-      }
+      if (msg.role !== "user" && msg.role !== "assistant") continue;
+      recordTurn(msg.role, "content" in msg ? extractText(msg.content) : "");
     }
   });
 
@@ -699,23 +691,66 @@ export default function (pi: ExtensionAPI) {
    * Synchronous and cheap, so it is safe on the shutdown path.
    */
   function enqueuePendingTail(): void {
-    if (!store || pendingUserMessages.length < 3) return;
+    if (!store || pendingTurns.length < 3) return;
     try {
       store.enqueuePending(
         `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
-        {
-          userMessages: pendingUserMessages,
-          assistantMessages: pendingAssistantMessages,
-          cwd: sessionCwd,
-          sessionId,
-        } satisfies ConsolidationInput,
-        pendingUserMessages.length,
+        consolidationInput(),
+        pendingTurns.length,
       );
     } catch {
       // Never break the session over a failed enqueue.
     } finally {
-      pendingUserMessages = [];
-      pendingAssistantMessages = [];
+      pendingTurns = [];
+    }
+  }
+
+  /** Snapshot of the turn buffer in the shape the consolidator expects. */
+  function consolidationInput(): ConsolidationInput {
+    return {
+      turns: pendingTurns,
+      userMessages: pendingTurns.map(t => t.user),
+      assistantMessages: pendingTurns.map(t => t.assistant).filter((t): t is string => !!t),
+      cwd: sessionCwd,
+      sessionId,
+    };
+  }
+
+  /**
+   * Count a failed attempt, and drop the job once retrying is pointless.
+   * Returns "retry" when the job is queued again, "dropped" when it is gone.
+   */
+  function failOrDrop(jobId: number, reason: string): "retry" | "dropped" {
+    if (!store) return "dropped";
+    try {
+      const attempts = store.withBusyTimeout(DB_YIELD_MS, () => store!.failPending(jobId));
+      if (attempts < MAX_CONSOLIDATION_ATTEMPTS) {
+        console.error(`pi-memory: ${reason} (attempt ${attempts}/${MAX_CONSOLIDATION_ATTEMPTS}); queued for a later idle moment`);
+        return "retry";
+      }
+      store.withBusyTimeout(DB_YIELD_MS, () => store!.deletePending(jobId));
+      console.error(`pi-memory: dropping the queued tail after ${attempts} attempts (${reason})`);
+      return "dropped";
+    } catch {
+      return "retry";
+    }
+  }
+
+  /**
+   * Append one message to the turn buffer.
+   *
+   * Assistant text overwrites: the last text block in a turn is its final
+   * answer, while earlier blocks are tool preambles with nothing durable in
+   * them. Recording them separately is what made user/assistant pairing drift.
+   */
+  function recordTurn(role: unknown, text: string): void {
+    if (!text) return;
+    if (role === "user") {
+      pendingTurns.push({ user: text });
+      if (pendingTurns.length > 60) pendingTurns.shift();
+    } else if (role === "assistant") {
+      const last = pendingTurns[pendingTurns.length - 1];
+      if (last) last.assistant = text;
     }
   }
 
@@ -732,9 +767,11 @@ export default function (pi: ExtensionAPI) {
     let showedStatus = false;
     try {
       while (store) {
+        // Yield rather than wait: a 5 s busy timeout would block this process's
+        // event loop, and the queue can retry a write that lost the race.
         let job: { id: number; payload: string } | undefined;
         try {
-          job = store.claimPending();
+          job = store.withBusyTimeout(DB_YIELD_MS, () => store!.claimPending());
         } catch {
           return;
         }
@@ -745,25 +782,35 @@ export default function (pi: ExtensionAPI) {
           showedStatus = true;
           try { ctx?.ui?.setStatus("pi-memory", "🧠 Consolidating memory..."); } catch { /* stale ctx */ }
         }
-        const input = JSON.parse(job.payload) as ConsolidationInput;
+
+        let input: ConsolidationInput;
+        try {
+          input = JSON.parse(job.payload) as ConsolidationInput;
+        } catch {
+          // Unreadable payload: retrying cannot fix it.
+          try { store.withBusyTimeout(DB_YIELD_MS, () => store!.deletePending(job!.id)); } catch { /* leave it */ }
+          currentJobId = null;
+          continue;
+        }
+
         const extracted = await extractFrom(input);
-        if (!store) return;
+        if (!store) return; // shutdown while the model was answering
+
         if (!extracted) {
-          // Model unavailable. Drop the job like the old best-effort path did
-          // — retrying a prompt the provider keeps failing only re-burns tokens.
-          try {
-            store.deletePending(job.id);
-            currentJobId = null;
-          } catch {
-            return;
-          }
+          // Provider failed. Keep the job — an outage should not cost the user
+          // a conversation — but stop retrying one that keeps failing.
+          const outcome = failOrDrop(job.id, "consolidation model call failed");
+          currentJobId = null;
+          if (outcome === "retry") return;
           continue;
         }
         try {
-          applyExtraction(input, extracted, job.id);
+          store.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(input, extracted!, job.id));
           currentJobId = null;
         } catch {
-          return; // stays claimed, retried after the stale window
+          failOrDrop(job.id, "writing the extraction failed");
+          currentJobId = null;
+          return;
         }
       }
     } finally {
@@ -1040,7 +1087,7 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      if (pendingUserMessages.length < 2) {
+      if (pendingTurns.length < 2) {
         ctx.ui.notify("Not enough conversation to consolidate (need at least 2 user messages)", "warning");
         return;
       }
@@ -1051,16 +1098,10 @@ export default function (pi: ExtensionAPI) {
         // consolidate the same tail twice, and so a failure stays retryable.
         store.enqueuePending(
           `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
-          {
-            userMessages: pendingUserMessages,
-            assistantMessages: pendingAssistantMessages,
-            cwd: sessionCwd,
-            sessionId,
-          } satisfies ConsolidationInput,
-          pendingUserMessages.length,
+          consolidationInput(),
+          pendingTurns.length,
         );
-        pendingUserMessages = [];
-        pendingAssistantMessages = [];
+        pendingTurns = [];
         await drainPending(ctx);
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";

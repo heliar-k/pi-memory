@@ -15,11 +15,31 @@ import type { MemoryStore } from "./store.js";
 
 // ─── Types ───────────────────────────────────────────────────────────
 
+/** One user turn and the assistant text that answered it. */
+export interface ConversationTurn {
+  user: string;
+  /**
+   * The turn's final assistant text. Intermediate steps (tool preambles) are
+   * dropped: they carry no durable facts and they are what made index pairing
+   * drift in the first place.
+   */
+  assistant?: string;
+}
+
 export interface ConsolidationInput {
-  /** User messages from the session */
+  /** User messages from the session. Kept for queue payloads written before `turns`. */
   userMessages: string[];
-  /** Assistant messages from the session */
+  /** Assistant messages from the session. Same compatibility note as above. */
   assistantMessages: string[];
+  /**
+   * Ordered turns — the preferred source for the prompt.
+   *
+   * Assistant messages outnumber user messages by an order of magnitude in a
+   * tool-heavy session (measured: 19 user vs 224 assistant in one real one),
+   * so pairing them by index puts unrelated tool chatter next to later
+   * questions.
+   */
+  turns?: ConversationTurn[];
   /** Working directory of the session */
   cwd?: string;
   /** Session ID for provenance */
@@ -78,6 +98,19 @@ Respond with ONLY valid JSON matching this schema:
 
 If nothing worth extracting, return: { "semantic": [], "lessons": [] }`;
 
+/**
+ * Turns for the prompt. `turns` is authoritative; the index pairing is only a
+ * fallback for a queue payload written by an older build.
+ */
+function resolveTurns(input: ConsolidationInput): ConversationTurn[] {
+  if (input.turns && input.turns.length > 0) return input.turns;
+  const out: ConversationTurn[] = [];
+  for (let i = 0; i < input.userMessages.length; i++) {
+    out.push({ user: input.userMessages[i] ?? "", assistant: input.assistantMessages[i] });
+  }
+  return out;
+}
+
 // ─── Consolidation ───────────────────────────────────────────────────
 
 /**
@@ -117,14 +150,13 @@ export function buildConsolidationPrompt(
     memorySection = parts.join("\n") + "\n\n";
   }
 
-  // Interleave user/assistant messages for context
-  const maxPairs = 30; // cap to avoid huge prompts
-  const len = Math.min(input.userMessages.length, maxPairs);
-  for (let i = 0; i < len; i++) {
-    const userMsg = input.userMessages[i];
-    if (userMsg) messages.push(`User: ${truncate(userMsg, 1000)}`);
-    const assistantMsg = input.assistantMessages[i];
-    if (assistantMsg) messages.push(`Assistant: ${truncate(assistantMsg, 500)}`);
+  // Interleave turns for context. The newest ones win the 30-turn budget: the
+  // buffer already holds the most recent conversation, and a preference is
+  // usually established in the latest exchange rather than the oldest stored one.
+  const maxTurns = 30;
+  for (const turn of resolveTurns(input).slice(-maxTurns)) {
+    if (turn.user) messages.push(`User: ${truncate(turn.user, 1000)}`);
+    if (turn.assistant) messages.push(`Assistant: ${truncate(turn.assistant, 500)}`);
   }
 
   return `${CONSOLIDATION_PROMPT}

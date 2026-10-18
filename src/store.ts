@@ -138,13 +138,18 @@ export class MemoryStore {
         session_id TEXT,
         user_count INTEGER NOT NULL DEFAULT 0,
         payload TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         claimed_at TEXT
       );
     `);
 
     // Migration: the first outbox shipped without session_id/user_count.
-    for (const column of ["session_id TEXT", "user_count INTEGER NOT NULL DEFAULT 0"]) {
+    for (const column of [
+      "session_id TEXT",
+      "user_count INTEGER NOT NULL DEFAULT 0",
+      "attempts INTEGER NOT NULL DEFAULT 0",
+    ]) {
       try {
         this.db.exec(`ALTER TABLE pending_consolidation ADD COLUMN ${column}`);
       } catch {
@@ -710,6 +715,40 @@ export class MemoryStore {
     this.withLock(() => {
       this.db.prepare("UPDATE pending_consolidation SET claimed_at = NULL WHERE id = ?").run(id);
     });
+  }
+
+  /**
+   * Record a failed attempt and requeue the job. Returns the new attempt count,
+   * so the caller can decide when to stop retrying a prompt that keeps failing.
+   */
+  failPending(id: number): number {
+    return this.withLock(() => {
+      this.db
+        .prepare("UPDATE pending_consolidation SET attempts = attempts + 1, claimed_at = NULL WHERE id = ?")
+        .run(id);
+      const row = this.db.prepare("SELECT attempts FROM pending_consolidation WHERE id = ?").get(id) as
+        | { attempts: number }
+        | undefined;
+      return row?.attempts ?? 0;
+    });
+  }
+
+  /**
+   * Run `fn` with a short busy timeout.
+   *
+   * node:sqlite is synchronous, so `BEGIN IMMEDIATE` against a lock held by
+   * another process blocks *this* process's event loop for up to busy_timeout —
+   * i.e. a background write can freeze the TUI for seconds. Background work
+   * should yield instead and let the queue retry it.
+   */
+  withBusyTimeout<T>(ms: number, fn: () => T): T {
+    const previous = (this.db.prepare("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(ms))}`);
+    try {
+      return fn();
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout = ${previous}`);
+    }
   }
 
   pendingCount(): number {

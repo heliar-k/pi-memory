@@ -353,6 +353,22 @@ describe("MemoryStore", () => {
       }
     });
 
+    it("counts a failed attempt and puts the job back", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
+        const job = q.claimPending()!;
+
+        assert.equal(q.failPending(job.id), 1);
+        // Requeued immediately, so the next idle moment retries it.
+        assert.equal(q.claimPending()?.id, job.id);
+        assert.equal(q.failPending(job.id), 2);
+        assert.equal(q.failPending(job.id), 3);
+      } finally {
+        q.close();
+      }
+    });
+
     it("stays bounded when drains keep failing", (t) => {
       const q = new MemoryStore(dbPath(t.name));
       try {

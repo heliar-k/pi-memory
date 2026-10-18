@@ -96,11 +96,16 @@ var MemoryStore = class {
         session_id TEXT,
         user_count INTEGER NOT NULL DEFAULT 0,
         payload TEXT NOT NULL,
+        attempts INTEGER NOT NULL DEFAULT 0,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         claimed_at TEXT
       );
     `);
-    for (const column of ["session_id TEXT", "user_count INTEGER NOT NULL DEFAULT 0"]) {
+    for (const column of [
+      "session_id TEXT",
+      "user_count INTEGER NOT NULL DEFAULT 0",
+      "attempts INTEGER NOT NULL DEFAULT 0"
+    ]) {
       try {
         this.db.exec(`ALTER TABLE pending_consolidation ADD COLUMN ${column}`);
       } catch {
@@ -533,6 +538,34 @@ var MemoryStore = class {
     this.withLock(() => {
       this.db.prepare("UPDATE pending_consolidation SET claimed_at = NULL WHERE id = ?").run(id);
     });
+  }
+  /**
+   * Record a failed attempt and requeue the job. Returns the new attempt count,
+   * so the caller can decide when to stop retrying a prompt that keeps failing.
+   */
+  failPending(id) {
+    return this.withLock(() => {
+      this.db.prepare("UPDATE pending_consolidation SET attempts = attempts + 1, claimed_at = NULL WHERE id = ?").run(id);
+      const row = this.db.prepare("SELECT attempts FROM pending_consolidation WHERE id = ?").get(id);
+      return row?.attempts ?? 0;
+    });
+  }
+  /**
+   * Run `fn` with a short busy timeout.
+   *
+   * node:sqlite is synchronous, so `BEGIN IMMEDIATE` against a lock held by
+   * another process blocks *this* process's event loop for up to busy_timeout —
+   * i.e. a background write can freeze the TUI for seconds. Background work
+   * should yield instead and let the queue retry it.
+   */
+  withBusyTimeout(ms, fn) {
+    const previous = this.db.prepare("PRAGMA busy_timeout").get().timeout;
+    this.db.exec(`PRAGMA busy_timeout = ${Math.max(0, Math.floor(ms))}`);
+    try {
+      return fn();
+    } finally {
+      this.db.exec(`PRAGMA busy_timeout = ${previous}`);
+    }
   }
   pendingCount() {
     return this.db.prepare("SELECT COUNT(*) AS c FROM pending_consolidation").get().c;
@@ -1171,6 +1204,14 @@ Respond with ONLY valid JSON matching this schema:
 }
 
 If nothing worth extracting, return: { "semantic": [], "lessons": [] }`;
+function resolveTurns(input) {
+  if (input.turns && input.turns.length > 0) return input.turns;
+  const out = [];
+  for (let i = 0; i < input.userMessages.length; i++) {
+    out.push({ user: input.userMessages[i] ?? "", assistant: input.assistantMessages[i] });
+  }
+  return out;
+}
 function buildConsolidationPrompt(input, currentFacts, currentLessons) {
   const messages = [];
   let memorySection = "";
@@ -1204,13 +1245,10 @@ function buildConsolidationPrompt(input, currentFacts, currentLessons) {
     }
     memorySection = parts.join("\n") + "\n\n";
   }
-  const maxPairs = 30;
-  const len = Math.min(input.userMessages.length, maxPairs);
-  for (let i = 0; i < len; i++) {
-    const userMsg = input.userMessages[i];
-    if (userMsg) messages.push(`User: ${truncate2(userMsg, 1e3)}`);
-    const assistantMsg = input.assistantMessages[i];
-    if (assistantMsg) messages.push(`Assistant: ${truncate2(assistantMsg, 500)}`);
+  const maxTurns = 30;
+  for (const turn of resolveTurns(input).slice(-maxTurns)) {
+    if (turn.user) messages.push(`User: ${truncate2(turn.user, 1e3)}`);
+    if (turn.assistant) messages.push(`Assistant: ${truncate2(turn.assistant, 500)}`);
   }
   return `${CONSOLIDATION_PROMPT}
 
@@ -1327,6 +1365,8 @@ var DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
 var DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
 var GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 var DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
+var MAX_CONSOLIDATION_ATTEMPTS = 3;
+var DB_YIELD_MS = 250;
 function warnUnknownKeys(block, blockName, knownKeys) {
   if (!block || typeof block !== "object") return;
   const unknown = Object.keys(block).filter((k) => !knownKeys.includes(k));
@@ -1427,8 +1467,7 @@ function readSettingsConfig(cwd) {
 }
 function index_default(pi) {
   let store = null;
-  let pendingUserMessages = [];
-  let pendingAssistantMessages = [];
+  let pendingTurns = [];
   let sessionCwd = "";
   let sessionId;
   let cachedCtx = null;
@@ -1539,21 +1578,14 @@ function index_default(pi) {
       notifiedReasons = /* @__PURE__ */ new Set();
       getEmbedder();
       if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
-      pendingUserMessages = [];
-      pendingAssistantMessages = [];
+      pendingTurns = [];
       try {
         const branch = ctx.sessionManager.getBranch();
         for (const entry of branch) {
           if (entry.type !== "message") continue;
           const msg = entry.message;
           if (!msg) continue;
-          if (msg.role === "user") {
-            const text = extractText(msg.content);
-            if (text) pendingUserMessages.push(text);
-          } else if (msg.role === "assistant") {
-            const text = extractText(msg.content);
-            if (text) pendingAssistantMessages.push(text);
-          }
+          recordTurn(msg.role, extractText(msg.content));
         }
       } catch {
       }
@@ -1635,19 +1667,8 @@ ${text}` };
   });
   pi.on("agent_end", async (event, _ctx) => {
     for (const msg of event.messages) {
-      if (msg.role === "user" && "content" in msg) {
-        const text = extractText(msg.content);
-        if (text) {
-          pendingUserMessages.push(text);
-          if (pendingUserMessages.length > 60) pendingUserMessages.shift();
-        }
-      } else if (msg.role === "assistant" && "content" in msg) {
-        const text = extractText(msg.content);
-        if (text) {
-          pendingAssistantMessages.push(text);
-          if (pendingAssistantMessages.length > 60) pendingAssistantMessages.shift();
-        }
-      }
+      if (msg.role !== "user" && msg.role !== "assistant") continue;
+      recordTurn(msg.role, "content" in msg ? extractText(msg.content) : "");
     }
   });
   pi.on("session_before_switch", () => {
@@ -1669,22 +1690,50 @@ ${text}` };
     if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending(ctx);
   });
   function enqueuePendingTail() {
-    if (!store || pendingUserMessages.length < 3) return;
+    if (!store || pendingTurns.length < 3) return;
     try {
       store.enqueuePending(
         `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
-        {
-          userMessages: pendingUserMessages,
-          assistantMessages: pendingAssistantMessages,
-          cwd: sessionCwd,
-          sessionId
-        },
-        pendingUserMessages.length
+        consolidationInput(),
+        pendingTurns.length
       );
     } catch {
     } finally {
-      pendingUserMessages = [];
-      pendingAssistantMessages = [];
+      pendingTurns = [];
+    }
+  }
+  function consolidationInput() {
+    return {
+      turns: pendingTurns,
+      userMessages: pendingTurns.map((t) => t.user),
+      assistantMessages: pendingTurns.map((t) => t.assistant).filter((t) => !!t),
+      cwd: sessionCwd,
+      sessionId
+    };
+  }
+  function failOrDrop(jobId, reason) {
+    if (!store) return "dropped";
+    try {
+      const attempts = store.withBusyTimeout(DB_YIELD_MS, () => store.failPending(jobId));
+      if (attempts < MAX_CONSOLIDATION_ATTEMPTS) {
+        console.error(`pi-memory: ${reason} (attempt ${attempts}/${MAX_CONSOLIDATION_ATTEMPTS}); queued for a later idle moment`);
+        return "retry";
+      }
+      store.withBusyTimeout(DB_YIELD_MS, () => store.deletePending(jobId));
+      console.error(`pi-memory: dropping the queued tail after ${attempts} attempts (${reason})`);
+      return "dropped";
+    } catch {
+      return "retry";
+    }
+  }
+  function recordTurn(role, text) {
+    if (!text) return;
+    if (role === "user") {
+      pendingTurns.push({ user: text });
+      if (pendingTurns.length > 60) pendingTurns.shift();
+    } else if (role === "assistant") {
+      const last = pendingTurns[pendingTurns.length - 1];
+      if (last) last.assistant = text;
     }
   }
   async function drainPending(ctx) {
@@ -1695,7 +1744,7 @@ ${text}` };
       while (store) {
         let job;
         try {
-          job = store.claimPending();
+          job = store.withBusyTimeout(DB_YIELD_MS, () => store.claimPending());
         } catch {
           return;
         }
@@ -1708,22 +1757,31 @@ ${text}` };
           } catch {
           }
         }
-        const input = JSON.parse(job.payload);
+        let input;
+        try {
+          input = JSON.parse(job.payload);
+        } catch {
+          try {
+            store.withBusyTimeout(DB_YIELD_MS, () => store.deletePending(job.id));
+          } catch {
+          }
+          currentJobId = null;
+          continue;
+        }
         const extracted = await extractFrom(input);
         if (!store) return;
         if (!extracted) {
-          try {
-            store.deletePending(job.id);
-            currentJobId = null;
-          } catch {
-            return;
-          }
+          const outcome = failOrDrop(job.id, "consolidation model call failed");
+          currentJobId = null;
+          if (outcome === "retry") return;
           continue;
         }
         try {
-          applyExtraction(input, extracted, job.id);
+          store.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(input, extracted, job.id));
           currentJobId = null;
         } catch {
+          failOrDrop(job.id, "writing the extraction failed");
+          currentJobId = null;
           return;
         }
       }
@@ -1947,7 +2005,7 @@ ${text}` };
         ctx.ui.notify("Memory store not initialized", "warning");
         return;
       }
-      if (pendingUserMessages.length < 2) {
+      if (pendingTurns.length < 2) {
         ctx.ui.notify("Not enough conversation to consolidate (need at least 2 user messages)", "warning");
         return;
       }
@@ -1955,16 +2013,10 @@ ${text}` };
       try {
         store.enqueuePending(
           `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
-          {
-            userMessages: pendingUserMessages,
-            assistantMessages: pendingAssistantMessages,
-            cwd: sessionCwd,
-            sessionId
-          },
-          pendingUserMessages.length
+          consolidationInput(),
+          pendingTurns.length
         );
-        pendingUserMessages = [];
-        pendingAssistantMessages = [];
+        pendingTurns = [];
         await drainPending(ctx);
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";

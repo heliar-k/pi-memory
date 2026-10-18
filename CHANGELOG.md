@@ -6,6 +6,24 @@ All notable changes to `@samfp/pi-memory`. Versions follow [semver](https://semv
 
 Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 
+### Fixed
+
+- **Consolidation prompts pair each question with its own answer.** The two
+  message arrays were paired by index, but assistant text outnumbers user
+  messages by an order of magnitude in a tool-heavy session (19 vs 197 in real
+  ones) — measured across the 12 largest local sessions, **221 of 233 pairs
+  (95%)** put unrelated tool chatter next to a later question. Turns are now
+  recorded in order, the last assistant text of each turn wins, and the newest
+  30 turns are used instead of the oldest. Payloads queued by an older build
+  still fall back to index pairing.
+- **A failed consolidation is retried instead of dropped.** A provider hiccup
+  used to discard the whole tail. Jobs now carry an attempt count, are
+  requeued on failure, and are only dropped after 3 attempts.
+- **Background writes yield instead of blocking the UI.** `BEGIN IMMEDIATE`
+  runs inside SQLite's busy wait, which blocks this process's event loop for up
+  to `busy_timeout` (5 s) when another pi has the write lock. The drain now uses
+  a 250 ms timeout and requeues the work when it loses the race.
+
 ### Changed
 
 - **Consolidation no longer runs while you are waiting.** It used to be awaited
