@@ -456,7 +456,12 @@ export default function (pi: ExtensionAPI) {
       embedFailure = null;
       notifiedReasons = new Set();
       // Deliberately not awaited: startup must not block on a provider call.
-      void backfillEmbeddings(ctx);
+      //
+      // Only in long-lived modes, though. An in-flight HTTP request keeps the
+      // event loop alive, so `pi -p` would not exit until the backfill settled —
+      // measured at ~3 s of tail latency on a script that only wanted one answer.
+      // Vectors are an optimisation for `memory_search`; a print run can skip it.
+      if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
 
       // Seed pending messages from existing session history so that
       // /memory-consolidate works even when resuming a session (the

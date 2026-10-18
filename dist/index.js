@@ -1535,7 +1535,7 @@ function index_default(pi) {
       embedder = null;
       embedFailure = null;
       notifiedReasons = /* @__PURE__ */ new Set();
-      void backfillEmbeddings(ctx);
+      if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
       pendingUserMessages = [];
       pendingAssistantMessages = [];
       try {
