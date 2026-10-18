@@ -111,10 +111,7 @@ var MemoryStore = class {
       } catch {
       }
     }
-    this.db.exec(
-      `CREATE UNIQUE INDEX IF NOT EXISTS pending_session
-         ON pending_consolidation(session_id) WHERE claimed_at IS NULL`
-    );
+    this.db.exec(`DROP INDEX IF EXISTS pending_session`);
     try {
       this.db.exec(`ALTER TABLE semantic ADD COLUMN last_accessed TEXT`);
     } catch {
@@ -168,9 +165,17 @@ var MemoryStore = class {
       }
       if (!ftsInSync) {
         this.db.exec("BEGIN");
-        this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
-        this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
-        this.db.exec("COMMIT");
+        try {
+          this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
+          this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try {
+            this.db.exec("ROLLBACK");
+          } catch {
+          }
+          throw err;
+        }
       }
       this.hasFTS5 = true;
     } catch {
@@ -487,19 +492,23 @@ var MemoryStore = class {
    * consolidation run costs. That is the whole point — the expensive part
    * must not run while the user is waiting to quit or switch sessions.
    *
-   * Keyed per session: re-seeding the same history (every resumed session does)
-   * replaces the queued tail only if it carries more messages, so the queue
-   * cannot grow one duplicate job per run. Bounded to the newest 20 sessions.
+   * Tails supersede each other instead of conflicting: a resumed session
+   * re-seeds its whole history, so a new tail that carries at least as many
+   * messages replaces the older unclaimed ones (the queue cannot grow one
+   * duplicate job per run). A *smaller* tail is new information — it only
+   * exists after a drain cleared the buffer — so it is queued alongside; two
+   * surviving rows are two genuinely unconsumed tails, not a duplicate. A
+   * claimed row is mid-flight and is never touched.
    */
   enqueuePending(sessionId, payload, userCount) {
     const json = JSON.stringify(payload);
+    const key = sessionId ?? null;
     this.withLock(() => {
       this.db.prepare(
-        `INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)
-           ON CONFLICT(session_id) WHERE claimed_at IS NULL
-           DO UPDATE SET payload = excluded.payload, user_count = excluded.user_count
-           WHERE excluded.user_count > pending_consolidation.user_count`
-      ).run(sessionId ?? null, userCount, json);
+        `DELETE FROM pending_consolidation
+           WHERE session_id IS ? AND claimed_at IS NULL AND user_count <= ?`
+      ).run(key, userCount);
+      this.db.prepare("INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)").run(key, userCount, json);
       this.db.prepare(
         `DELETE FROM pending_consolidation WHERE id NOT IN
            (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`
@@ -1366,6 +1375,11 @@ var DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
 var DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
 var GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
 var DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
+function isBusyError(err) {
+  const code = err?.errcode ?? 0;
+  const message = String(err?.message ?? err);
+  return code === 5 || code === 6 || /database (table )?is locked|SQLITE_BUSY/i.test(message);
+}
 var MAX_CONSOLIDATION_ATTEMPTS = 3;
 var DB_YIELD_MS = 250;
 function warnUnknownKeys(block, blockName, knownKeys) {
@@ -1701,9 +1715,8 @@ ${text}` };
         consolidationInput(),
         pendingTurns.length
       );
-    } catch {
-    } finally {
       pendingTurns = [];
+    } catch {
     }
   }
   function consolidationInput() {
@@ -1715,15 +1728,14 @@ ${text}` };
       sessionId
     };
   }
-  function failOrDrop(jobId, reason) {
-    if (!store) return "dropped";
+  function failOrDrop(s, jobId, reason) {
     try {
-      const attempts = store.withBusyTimeout(DB_YIELD_MS, () => store.failPending(jobId));
+      const attempts = s.withBusyTimeout(DB_YIELD_MS, () => s.failPending(jobId));
       if (attempts < MAX_CONSOLIDATION_ATTEMPTS) {
         console.error(`pi-memory: ${reason} (attempt ${attempts}/${MAX_CONSOLIDATION_ATTEMPTS}); queued for a later idle moment`);
         return "retry";
       }
-      store.withBusyTimeout(DB_YIELD_MS, () => store.deletePending(jobId));
+      s.withBusyTimeout(DB_YIELD_MS, () => s.deletePending(jobId));
       console.error(`pi-memory: dropping the queued tail after ${attempts} attempts (${reason})`);
       return "dropped";
     } catch {
@@ -1745,10 +1757,12 @@ ${text}` };
     draining = true;
     let showedStatus = false;
     try {
-      while (store) {
+      for (; ; ) {
+        const s = store;
+        if (!s) return;
         let job;
         try {
-          job = store.withBusyTimeout(DB_YIELD_MS, () => store.claimPending());
+          job = s.withBusyTimeout(DB_YIELD_MS, () => s.claimPending());
         } catch {
           return;
         }
@@ -1766,25 +1780,39 @@ ${text}` };
           input = JSON.parse(job.payload);
         } catch {
           try {
-            store.withBusyTimeout(DB_YIELD_MS, () => store.deletePending(job.id));
+            s.withBusyTimeout(DB_YIELD_MS, () => s.deletePending(job.id));
           } catch {
           }
           currentJobId = null;
           continue;
         }
         const extracted = await extractFrom(input);
-        if (!store) return;
+        if (store !== s) {
+          try {
+            s.withBusyTimeout(DB_YIELD_MS, () => s.releasePending(job.id));
+          } catch {
+          }
+          currentJobId = null;
+          return;
+        }
         if (!extracted) {
-          const outcome = failOrDrop(job.id, "consolidation model call failed");
+          const outcome = failOrDrop(s, job.id, "consolidation model call failed");
           currentJobId = null;
           if (outcome === "retry") return;
           continue;
         }
         try {
-          store.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(input, extracted, job.id));
+          s.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(s, input, extracted, job.id));
           currentJobId = null;
-        } catch {
-          failOrDrop(job.id, "writing the extraction failed");
+        } catch (err) {
+          if (isBusyError(err)) {
+            try {
+              s.withBusyTimeout(DB_YIELD_MS, () => s.releasePending(job.id));
+            } catch {
+            }
+          } else {
+            failOrDrop(s, job.id, "writing the extraction failed");
+          }
           currentJobId = null;
           return;
         }
@@ -1841,12 +1869,11 @@ ${text}` };
       if (backstopHandle) clearTimeout(backstopHandle);
     }
   }
-  function applyExtraction(input, extracted, jobId) {
-    if (!store) return;
+  function applyExtraction(s, input, extracted, jobId) {
     const slug = input.cwd ? projectSlug(input.cwd) : void 0;
-    store.transaction(() => {
-      const applied = applyExtracted(store, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
-      if (jobId !== null) store.deletePending(jobId);
+    s.transaction(() => {
+      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
+      if (jobId !== null) s.deletePending(jobId);
       if (applied.semantic + applied.lessons > 0) {
         console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
       }
@@ -2024,6 +2051,10 @@ ${text}` };
           pendingTurns.length
         );
         pendingTurns = [];
+        if (draining) {
+          ctx.ui.notify("Consolidation already running \u2014 this tail is queued behind it", "info");
+          return;
+        }
         await drainPending(ctx);
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";

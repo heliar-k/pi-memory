@@ -105,6 +105,13 @@ const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
  */
 export const DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
 
+/** SQLITE_BUSY / SQLITE_LOCKED: someone else holds the write lock. */
+function isBusyError(err: unknown): boolean {
+  const code = (err as { errcode?: number })?.errcode ?? 0;
+  const message = String((err as { message?: string })?.message ?? err);
+  return code === 5 || code === 6 || /database (table )?is locked|SQLITE_BUSY/i.test(message);
+}
+
 /** Give up on a queued tail after this many failed consolidation attempts. */
 const MAX_CONSOLIDATION_ATTEMPTS = 3;
 
@@ -701,10 +708,11 @@ export default function (pi: ExtensionAPI) {
         consolidationInput(),
         pendingTurns.length,
       );
-    } catch {
-      // Never break the session over a failed enqueue.
-    } finally {
+      // Stored durably — the drain owns it now.
       pendingTurns = [];
+    } catch {
+      // Keep the buffer: a failed write must not cost the conversation. The
+      // next idle moment tries again with a bigger tail.
     }
   }
 
@@ -723,15 +731,14 @@ export default function (pi: ExtensionAPI) {
    * Count a failed attempt, and drop the job once retrying is pointless.
    * Returns "retry" when the job is queued again, "dropped" when it is gone.
    */
-  function failOrDrop(jobId: number, reason: string): "retry" | "dropped" {
-    if (!store) return "dropped";
+  function failOrDrop(s: MemoryStore, jobId: number, reason: string): "retry" | "dropped" {
     try {
-      const attempts = store.withBusyTimeout(DB_YIELD_MS, () => store!.failPending(jobId));
+      const attempts = s.withBusyTimeout(DB_YIELD_MS, () => s.failPending(jobId));
       if (attempts < MAX_CONSOLIDATION_ATTEMPTS) {
         console.error(`pi-memory: ${reason} (attempt ${attempts}/${MAX_CONSOLIDATION_ATTEMPTS}); queued for a later idle moment`);
         return "retry";
       }
-      store.withBusyTimeout(DB_YIELD_MS, () => store!.deletePending(jobId));
+      s.withBusyTimeout(DB_YIELD_MS, () => s.deletePending(jobId));
       console.error(`pi-memory: dropping the queued tail after ${attempts} attempts (${reason})`);
       return "dropped";
     } catch {
@@ -769,12 +776,17 @@ export default function (pi: ExtensionAPI) {
     draining = true;
     let showedStatus = false;
     try {
-      while (store) {
+      for (;;) {
+        // Bind the store per job: a session switch can replace it while the
+        // model runs, and writing through the new one would put this project's
+        // facts in the next project's database and delete nothing.
+        const s = store;
+        if (!s) return;
         // Yield rather than wait: a 5 s busy timeout would block this process's
         // event loop, and the queue can retry a write that lost the race.
         let job: { id: number; payload: string } | undefined;
         try {
-          job = store.withBusyTimeout(DB_YIELD_MS, () => store!.claimPending());
+          job = s.withBusyTimeout(DB_YIELD_MS, () => s.claimPending());
         } catch {
           return;
         }
@@ -791,27 +803,40 @@ export default function (pi: ExtensionAPI) {
           input = JSON.parse(job.payload) as ConsolidationInput;
         } catch {
           // Unreadable payload: retrying cannot fix it.
-          try { store.withBusyTimeout(DB_YIELD_MS, () => store!.deletePending(job!.id)); } catch { /* leave it */ }
+          try { s.withBusyTimeout(DB_YIELD_MS, () => s.deletePending(job!.id)); } catch { /* leave it */ }
           currentJobId = null;
           continue;
         }
 
         const extracted = await extractFrom(input);
-        if (!store) return; // shutdown while the model was answering
+
+        if (store !== s) {
+          // The session switched under us (or shut down). Hand the job back to
+          // the store that owns it; the next idle moment picks it up.
+          try { s.withBusyTimeout(DB_YIELD_MS, () => s.releasePending(job!.id)); } catch { /* stale window */ }
+          currentJobId = null;
+          return;
+        }
 
         if (!extracted) {
           // Provider failed. Keep the job — an outage should not cost the user
           // a conversation — but stop retrying one that keeps failing.
-          const outcome = failOrDrop(job.id, "consolidation model call failed");
+          const outcome = failOrDrop(s, job.id, "consolidation model call failed");
           currentJobId = null;
           if (outcome === "retry") return;
           continue;
         }
         try {
-          store.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(input, extracted!, job.id));
+          s.withBusyTimeout(DB_YIELD_MS, () => applyExtraction(s, input, extracted!, job.id));
           currentJobId = null;
-        } catch {
-          failOrDrop(job.id, "writing the extraction failed");
+        } catch (err) {
+          if (isBusyError(err)) {
+            // Lost the write lock; nothing was written. Count it as a retry, not
+            // as a failed attempt — the extraction is already paid for.
+            try { s.withBusyTimeout(DB_YIELD_MS, () => s.releasePending(job!.id)); } catch { /* stale window */ }
+          } else {
+            failOrDrop(s, job.id, "writing the extraction failed");
+          }
           currentJobId = null;
           return;
         }
@@ -889,15 +914,15 @@ export default function (pi: ExtensionAPI) {
    * two produced observable duplicate work (facts written, job surviving).
    */
   function applyExtraction(
+    s: MemoryStore,
     input: ConsolidationInput,
     extracted: ExtractedMemory,
     jobId: number | null,
   ): void {
-    if (!store) return;
     const slug = input.cwd ? projectSlug(input.cwd) : undefined;
-    store.transaction(() => {
-      const applied = applyExtracted(store!, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
-      if (jobId !== null) store!.deletePending(jobId);
+    s.transaction(() => {
+      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
+      if (jobId !== null) s.deletePending(jobId);
       if (applied.semantic + applied.lessons > 0) {
         // Background work: log it, don't interrupt the user.
         console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
@@ -1108,6 +1133,12 @@ export default function (pi: ExtensionAPI) {
           pendingTurns.length,
         );
         pendingTurns = [];
+        if (draining) {
+          // A background drain is already running; it will pick this up, or the
+          // next idle moment will. Saying "updated" here would be a lie.
+          ctx.ui.notify("Consolidation already running — this tail is queued behind it", "info");
+          return;
+        }
         await drainPending(ctx);
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";

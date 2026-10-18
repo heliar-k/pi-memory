@@ -325,14 +325,32 @@ describe("MemoryStore", () => {
       }
     });
 
-    it("never shrinks a queued tail", (t) => {
+    it("queues a shorter tail alongside an older one", (t) => {
       const q = new MemoryStore(dbPath(t.name));
       try {
+        // A drain cleared the buffer, so this tail holds only the turns after
+        // it — new information, not a duplicate of the older one.
         q.enqueuePending("s1", tail("a", "b", "c", "d"), 4);
-        // After an in-session drain the buffer restarts empty; a smaller tail
-        // must not replace the fuller one that is still waiting.
-        q.enqueuePending("s1", tail("e"), 1);
-        assert.deepEqual(JSON.parse(q.claimPending()!.payload).userMessages, ["a", "b", "c", "d"]);
+        q.enqueuePending("s1", tail("e", "f", "g"), 3);
+        assert.equal(q.pendingCount(), 2);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("can requeue a job while a newer tail is waiting", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
+        const job = q.claimPending()!;
+        q.enqueuePending("s1", tail("d", "e", "f"), 3);
+
+        // Regression: a partial unique index on (session_id WHERE unclaimed)
+        // made both of these throw "UNIQUE constraint failed", so a claim could
+        // never be handed back and attempts never reached their cap.
+        assert.equal(q.failPending(job.id), 1);
+        q.releasePending(job.id);
+        assert.equal(q.pendingCount(), 2);
       } finally {
         q.close();
       }

@@ -156,13 +156,13 @@ export class MemoryStore {
         // Column already there.
       }
     }
-    // At most one queued (unclaimed) job per session: a resumed session re-seeds
-    // its whole history on every start, and without this the queue grew one
-    // duplicate job per run. A claimed job is mid-flight and stays untouched.
-    this.db.exec(
-      `CREATE UNIQUE INDEX IF NOT EXISTS pending_session
-         ON pending_consolidation(session_id) WHERE claimed_at IS NULL`,
-    );
+    // A partial unique index used to enforce "one unclaimed job per session".
+    // It was wrong: a drain in flight holds one row while a new tail queues a
+    // second, and clearing the claim then violates the index — which made
+    // releasePending/failPending throw, so a claim could never be handed back
+    // and attempts never reached their cap. Superseding happens in
+    // enqueuePending instead, where the two tails can actually be compared.
+    this.db.exec(`DROP INDEX IF EXISTS pending_session`);
 
     // Migration: add last_accessed column if missing
     try {
@@ -239,11 +239,18 @@ export class MemoryStore {
         ftsInSync = false;
       }
       if (!ftsInSync) {
-        // One transaction: the two rebuilds otherwise commit separately.
+        // One transaction: the two rebuilds otherwise commit separately. The
+        // rollback is not optional — an open transaction here makes every later
+        // BEGIN fail, i.e. the store silently turns read-only for the session.
         this.db.exec("BEGIN");
-        this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
-        this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
-        this.db.exec("COMMIT");
+        try {
+          this.db.exec(`INSERT INTO semantic_fts(semantic_fts) VALUES('rebuild')`);
+          this.db.exec(`INSERT INTO lessons_fts(lessons_fts) VALUES('rebuild')`);
+          this.db.exec("COMMIT");
+        } catch (err) {
+          try { this.db.exec("ROLLBACK"); } catch { /* transaction already gone */ }
+          throw err;
+        }
       }
       this.hasFTS5 = true;
     } catch {
@@ -655,21 +662,27 @@ export class MemoryStore {
    * consolidation run costs. That is the whole point — the expensive part
    * must not run while the user is waiting to quit or switch sessions.
    *
-   * Keyed per session: re-seeding the same history (every resumed session does)
-   * replaces the queued tail only if it carries more messages, so the queue
-   * cannot grow one duplicate job per run. Bounded to the newest 20 sessions.
+   * Tails supersede each other instead of conflicting: a resumed session
+   * re-seeds its whole history, so a new tail that carries at least as many
+   * messages replaces the older unclaimed ones (the queue cannot grow one
+   * duplicate job per run). A *smaller* tail is new information — it only
+   * exists after a drain cleared the buffer — so it is queued alongside; two
+   * surviving rows are two genuinely unconsumed tails, not a duplicate. A
+   * claimed row is mid-flight and is never touched.
    */
   enqueuePending(sessionId: string | undefined, payload: unknown, userCount: number): void {
     const json = JSON.stringify(payload);
+    const key = sessionId ?? null;
     this.withLock(() => {
       this.db
         .prepare(
-          `INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)
-           ON CONFLICT(session_id) WHERE claimed_at IS NULL
-           DO UPDATE SET payload = excluded.payload, user_count = excluded.user_count
-           WHERE excluded.user_count > pending_consolidation.user_count`,
+          `DELETE FROM pending_consolidation
+           WHERE session_id IS ? AND claimed_at IS NULL AND user_count <= ?`,
         )
-        .run(sessionId ?? null, userCount, json);
+        .run(key, userCount);
+      this.db
+        .prepare("INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)")
+        .run(key, userCount, json);
       this.db.prepare(
         `DELETE FROM pending_consolidation WHERE id NOT IN
            (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`,

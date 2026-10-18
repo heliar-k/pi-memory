@@ -16,7 +16,27 @@ Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 
 ### Fixed
 
-- **Consolidation prompts pair each question with its own answer.** The two
+- **A queued tail could be silently dropped, and a claim could never be handed
+  back.** The outbox enforced "one unclaimed job per session" with a partial
+  unique index, but a drain in flight holds a claim while a new tail queues a
+  second row — so `releasePending`/`failPending` then threw
+  `UNIQUE constraint failed`, which meant attempts never reached their cap and
+  quitting mid-consolidation left the job invisible for the 10-minute stale
+  window. Superseding now happens at enqueue time (a tail replaces older
+  unclaimed ones only when it carries at least as many messages), so a shorter
+  tail is queued alongside instead of being refused, and clearing a claim cannot
+  conflict.
+- **A failed enqueue no longer discards the buffer**, a lost write lock is no
+  longer counted as a failed attempt, and `/memory-consolidate` no longer reports
+  success when a background drain is already running.
+- **A drain that spans a session switch writes to the store it claimed from.**
+  Switching to a session in another project mid-call would have put this
+  project's facts in that project's database and deleted nothing.
+- **A failed FTS rebuild leaves no open transaction.** If the rebuild threw, the
+  transaction stayed open and every later write in the session failed with
+  "cannot start a transaction within a transaction" — the store silently turned
+  read-only.
+- **Consolidation prompts pair each question with its own answer.** with its own answer.** The two
   message arrays were paired by index, but assistant text outnumbers user
   messages by an order of magnitude in a tool-heavy session (19 vs 197 in real
   ones) — measured across the 12 largest local sessions, **221 of 233 pairs
