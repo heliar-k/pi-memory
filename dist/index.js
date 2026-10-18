@@ -1528,7 +1528,7 @@ function index_default(pi) {
     try {
       sessionCwd = ctx.cwd;
       cachedCtx = ctx;
-      sessionId = ctx.sessionId ?? ctx.session?.id;
+      sessionId = ctx.sessionManager?.getSessionId?.() ?? ctx.sessionId ?? ctx.session?.id;
       resolvedDbPath = resolveDbPath(sessionCwd);
       injectorConfig = readSettingsConfig(sessionCwd);
       store = new MemoryStore(resolvedDbPath);
@@ -1663,7 +1663,7 @@ ${text}` };
   });
   pi.on("agent_settled", (_event, ctx) => {
     enqueuePendingTail();
-    void drainPending(ctx);
+    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending(ctx);
   });
   function enqueuePendingTail() {
     if (!store || pendingUserMessages.length < 3) return;

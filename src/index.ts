@@ -443,7 +443,7 @@ export default function (pi: ExtensionAPI) {
     try {
       sessionCwd = ctx.cwd;
       cachedCtx = ctx;
-      sessionId = (ctx as any).sessionId ?? (ctx as any).session?.id;
+      sessionId = ctx.sessionManager?.getSessionId?.() ?? (ctx as any).sessionId ?? (ctx as any).session?.id;
 
       // Resolve per-agent DB path from local settings or cwd
       resolvedDbPath = resolveDbPath(sessionCwd);
@@ -674,7 +674,11 @@ export default function (pi: ExtensionAPI) {
   // keeps it safe if the process goes away first.
   pi.on("agent_settled", (_event, ctx) => {
     enqueuePendingTail();
-    void drainPending(ctx);
+    // Only drain where the process lives on afterwards. A print/json run exits
+    // the moment the turn finishes, so starting a multi-second child there
+    // would delay the script and never finish; the queued tail is picked up by
+    // the next interactive session instead.
+    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending(ctx);
   });
 
   /**
