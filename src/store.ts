@@ -79,6 +79,11 @@ export class MemoryStore {
 
     this.db = new DatabaseSync(dbPath);
     this.db.exec("PRAGMA journal_mode = WAL");
+    // WAL + NORMAL is durable across process crashes; only an OS/power crash can
+    // lose the newest commits. FULL costs an fsync per write — ~77 ms on a slow
+    // disk, i.e. ~85 ms for a single stored fact — and this store writes in small
+    // transactions from the session path.
+    this.db.exec("PRAGMA synchronous = NORMAL");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
