@@ -118,6 +118,16 @@ export class MemoryStore {
         details TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      -- Durable outbox for session-end consolidation. The session path only
+      -- appends here (one commit); the LLM call happens later, off the
+      -- interaction path.
+      CREATE TABLE IF NOT EXISTS pending_consolidation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        claimed_at TEXT
+      );
     `);
 
     // Migration: add last_accessed column if missing
@@ -587,13 +597,78 @@ export class MemoryStore {
     return this.db.prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit) as unknown as MemoryEvent[];
   }
 
+  // ─── Pending consolidation (outbox) ───────────────────────────────
+
+  /**
+   * Queue a session tail for later consolidation.
+   *
+   * One commit: ~13 ms at synchronous=NORMAL, against the several seconds a
+   * consolidation run costs. That is the whole point — the expensive part
+   * must not run while the user is waiting to quit or switch sessions.
+   * Bounded: an outage keeps at most the newest 20 jobs.
+   */
+  enqueuePending(payload: unknown): void {
+    const json = JSON.stringify(payload);
+    this.withLock(() => {
+      this.db.prepare("INSERT INTO pending_consolidation (payload) VALUES (?)").run(json);
+      this.db.prepare(
+        `DELETE FROM pending_consolidation WHERE id NOT IN
+           (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`,
+      ).run();
+    });
+  }
+
+  /**
+   * Take the oldest queued job, marking it claimed so a concurrent drainer
+   * skips it. A job whose claim is older than `staleAfterMinutes` is offered
+   * again: a drainer that was killed mid-run must not lose the work.
+   */
+  claimPending(staleAfterMinutes: number = 10): { id: number; payload: string } | undefined {
+    return this.withLock(() => {
+      const row = this.db
+        .prepare(
+          `SELECT id, payload FROM pending_consolidation
+           WHERE claimed_at IS NULL OR claimed_at < datetime('now', ?)
+           ORDER BY id LIMIT 1`,
+        )
+        .get(`-${staleAfterMinutes} minutes`) as { id: number; payload: string } | undefined;
+      if (!row) return undefined;
+      this.db
+        .prepare("UPDATE pending_consolidation SET claimed_at = datetime('now') WHERE id = ?")
+        .run(row.id);
+      return row;
+    });
+  }
+
+  /** Drop a job after its facts were written — at-least-once, never silent loss. */
+  deletePending(id: number): void {
+    this.withLock(() => {
+      this.db.prepare("DELETE FROM pending_consolidation WHERE id = ?").run(id);
+    });
+  }
+
+  /**
+   * Hand a claimed job back to the queue. Used when a drain is interrupted by
+   * shutdown: without it the job would sit claimed until the stale window
+   * expires, so a user who quits mid-consolidation would see a dead queue.
+   */
+  releasePending(id: number): void {
+    this.withLock(() => {
+      this.db.prepare("UPDATE pending_consolidation SET claimed_at = NULL WHERE id = ?").run(id);
+    });
+  }
+
+  pendingCount(): number {
+    return (this.db.prepare("SELECT COUNT(*) AS c FROM pending_consolidation").get() as { c: number }).c;
+  }
+
   // ─── Stats ───────────────────────────────────────────────────────
 
-  stats(): { semantic: number; lessons: number; events: number } {
+  stats(): { semantic: number; lessons: number; events: number; pending: number } {
     const semantic = (this.db.prepare("SELECT COUNT(*) as c FROM semantic").get() as any).c;
     const lessons = (this.db.prepare("SELECT COUNT(*) as c FROM lessons WHERE is_deleted = 0").get() as any).c;
     const events = (this.db.prepare("SELECT COUNT(*) as c FROM events").get() as any).c;
-    return { semantic, lessons, events };
+    return { semantic, lessons, events, pending: this.pendingCount() };
   }
 
   close(): void {

@@ -274,6 +274,13 @@ export default function (pi: ExtensionAPI) {
   let cachedCtx: any = null;
   let resolvedDbPath: string = DEFAULT_DB_PATH;
   let injectorConfig: InjectorConfig = readSettingsConfig();
+  // True while a background drain is running, so `agent_settled` firing again
+  // (queued turns, retries) does not start a second consolidation. It is a
+  // guard, not a lock: the database claim is what keeps two processes apart.
+  let draining = false;
+  // The job being consolidated right now, so shutdown can hand it back to the
+  // queue instead of leaving it claimed for the stale window.
+  let currentJobId: number | null = null;
 
   // Embedder is built lazily on first use and cached per session. `false` means
   // "tried and failed" so a broken provider is not retried on every query.
@@ -635,66 +642,107 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  // Consolidate memory when switching sessions (/new, /resume)
-  pi.on("session_before_switch", async (_event, ctx) => {
-    if (!store) return;
+  // Session switch (/new, /resume, /fork) and shutdown used to await the
+  // consolidation LLM call here — seconds of frozen UI at exactly the moment
+  // the user wants to leave. They now queue the tail (one commit) and return.
 
-    if (pendingUserMessages.length >= 3) {
-      ctx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
-      try {
-        await consolidateSession();
-      } catch {
-        // Best-effort
-      } finally {
-        // Always clear — even if consolidateSession threw synchronously or
-        // ctx went stale. Stuck indicator otherwise pins for the rest of
-        // the session. See samfoy/pi-total-recall#5.
-        try { ctx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
-      }
-    }
-
-    // Reset for the next session
-    pendingUserMessages = [];
-    pendingAssistantMessages = [];
+  pi.on("session_before_switch", () => {
+    enqueuePendingTail();
   });
 
   pi.on("session_shutdown", async () => {
     if (!store) return;
-
     try {
-      // Immediate visual feedback — user sees this as soon as C-c C-c fires
-      if (cachedCtx && pendingUserMessages.length >= 3) {
-        cachedCtx.ui.setStatus("pi-memory", "🧠 Consolidating memory...");
-      }
-
-      // Consolidate if we have enough conversation
-      if (pendingUserMessages.length >= 3) {
-        try {
-          await consolidateSession();
-        } catch {
-          // Best-effort — don't crash on shutdown
-        }
-      }
+      enqueuePendingTail();
+      // A drain interrupted by quitting goes back on the queue so the next
+      // session retries it immediately instead of after the stale window.
+      if (currentJobId !== null) store.releasePending(currentJobId);
+    } catch {
+      // Never fail a shutdown over the queue.
     } finally {
-      if (cachedCtx) {
-        try { cachedCtx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
-      }
       store.close();
       store = null;
     }
   });
 
+  //
+  // Idle-time consolidation. `agent_settled` fires when a run has fully
+  // finished and nothing is queued, which is the one moment where burning a
+  // few seconds of provider time costs the user nothing. The handler must not
+  // be awaited — pi waits for it — so the drain runs detached and the queue
+  // keeps it safe if the process goes away first.
+  pi.on("agent_settled", (_event, ctx) => {
+    enqueuePendingTail();
+    void drainPending(ctx);
+  });
+
+  /**
+   * Move the buffered tail into the durable outbox and clear the buffers.
+   * Synchronous and cheap, so it is safe on the shutdown path.
+   */
+  function enqueuePendingTail(): void {
+    if (!store || pendingUserMessages.length < 3) return;
+    try {
+      store.enqueuePending({
+        userMessages: pendingUserMessages,
+        assistantMessages: pendingAssistantMessages,
+        cwd: sessionCwd,
+        sessionId,
+      } satisfies ConsolidationInput);
+    } catch {
+      // Never break the session over a failed enqueue.
+    } finally {
+      pendingUserMessages = [];
+      pendingAssistantMessages = [];
+    }
+  }
+
+  /**
+   * Drain the outbox in the background.
+   *
+   * A job is deleted only after its facts are written, so a kill mid-run
+   * retries it once the claim goes stale instead of losing it. Never throws:
+   * it is called detached.
+   */
+  async function drainPending(ctx: any): Promise<void> {
+    if (draining) return;
+    draining = true;
+    let showedStatus = false;
+    try {
+      while (store) {
+        let job: { id: number; payload: string } | undefined;
+        try {
+          job = store.claimPending();
+        } catch {
+          return;
+        }
+        if (!job) return;
+        currentJobId = job.id;
+
+        if (!showedStatus) {
+          showedStatus = true;
+          try { ctx?.ui?.setStatus("pi-memory", "🧠 Consolidating memory..."); } catch { /* stale ctx */ }
+        }
+        try {
+          await consolidate(JSON.parse(job.payload) as ConsolidationInput);
+          store.deletePending(job.id);
+          currentJobId = null;
+        } catch {
+          return; // stays claimed, retried after the stale window
+        }
+      }
+    } finally {
+      if (showedStatus) {
+        try { ctx?.ui?.setStatus("pi-memory", ""); } catch { /* stale ctx */ }
+      }
+      draining = false;
+    }
+  }
+
   // ─── Consolidation ──────────────────────────────────────────────
 
-  async function consolidateSession(): Promise<void> {
+  async function consolidate(input: ConsolidationInput): Promise<void> {
     if (!store) return;
-
-    const input: ConsolidationInput = {
-      userMessages: pendingUserMessages,
-      assistantMessages: pendingAssistantMessages,
-      cwd: sessionCwd,
-      sessionId,
-    };
 
     const currentFacts = store.listSemantic(undefined, 200).map(f => ({ key: f.key, value: f.value }));
     const currentLessons = store.listLessons(undefined, 100).map(l => ({ rule: l.rule, category: l.category }));
@@ -720,7 +768,7 @@ export default function (pi: ExtensionAPI) {
         "--model", injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL,
       ], {
         timeout: EXEC_TIMEOUT_MS,
-        cwd: sessionCwd,
+        cwd: input.cwd ?? sessionCwd,
       });
 
       const result = await Promise.race([
@@ -735,10 +783,10 @@ export default function (pi: ExtensionAPI) {
 
       if (result.code === 0 && result.stdout) {
         const extracted = parseConsolidationResponse(result.stdout);
-        const slug = sessionCwd ? projectSlug(sessionCwd) : undefined;
-        const applied = applyExtracted(store!, extracted, `session:${sessionId ?? "unknown"}`, slug || undefined);
+        const slug = input.cwd ? projectSlug(input.cwd) : undefined;
+        const applied = applyExtracted(store!, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
         if (applied.semantic + applied.lessons > 0) {
-          // Log but don't notify — we're shutting down
+          // Background work: log it, don't interrupt the user.
           console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
         }
       }
@@ -906,6 +954,9 @@ export default function (pi: ExtensionAPI) {
         `Memory: ${stats.semantic} semantic facts, ${stats.lessons} active lessons, ${stats.events} events logged`,
         `DB: ${resolvedDbPath}`,
       ];
+      if (stats.pending > 0) {
+        lines.push(`Queued: ${stats.pending} unconsolidated session tail(s), processed when the session goes idle`);
+      }
       const cfg = injectorConfig.embedding;
       if (cfg) {
         const cov = store.embeddingCoverage();
@@ -941,9 +992,20 @@ export default function (pi: ExtensionAPI) {
 
       ctx.ui.notify("Consolidating session memory...", "info");
       try {
-        await consolidateSession();
+        // Go through the queue so a manual run and a background drain cannot
+        // consolidate the same tail twice, and so a failure stays retryable.
+        store.enqueuePending({
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          cwd: sessionCwd,
+          sessionId,
+        } satisfies ConsolidationInput);
+        pendingUserMessages = [];
+        pendingAssistantMessages = [];
+        await drainPending(ctx);
         const stats = store.stats();
-        ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons`, "info");
+        const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";
+        ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons${queued}`, "info");
       } catch (err: any) {
         ctx.ui.notify(`Consolidation failed: ${err.message}`, "error");
       }

@@ -82,6 +82,16 @@ var MemoryStore = class {
         details TEXT NOT NULL DEFAULT '',
         created_at TEXT NOT NULL DEFAULT (datetime('now'))
       );
+
+      -- Durable outbox for session-end consolidation. The session path only
+      -- appends here (one commit); the LLM call happens later, off the
+      -- interaction path.
+      CREATE TABLE IF NOT EXISTS pending_consolidation (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        payload TEXT NOT NULL,
+        created_at TEXT NOT NULL DEFAULT (datetime('now')),
+        claimed_at TEXT
+      );
     `);
     try {
       this.db.exec(`ALTER TABLE semantic ADD COLUMN last_accessed TEXT`);
@@ -435,12 +445,67 @@ var MemoryStore = class {
   listEvents(limit = 50) {
     return this.db.prepare("SELECT * FROM events ORDER BY id DESC LIMIT ?").all(limit);
   }
+  // ─── Pending consolidation (outbox) ───────────────────────────────
+  /**
+   * Queue a session tail for later consolidation.
+   *
+   * One commit: ~13 ms at synchronous=NORMAL, against the several seconds a
+   * consolidation run costs. That is the whole point — the expensive part
+   * must not run while the user is waiting to quit or switch sessions.
+   * Bounded: an outage keeps at most the newest 20 jobs.
+   */
+  enqueuePending(payload) {
+    const json = JSON.stringify(payload);
+    this.withLock(() => {
+      this.db.prepare("INSERT INTO pending_consolidation (payload) VALUES (?)").run(json);
+      this.db.prepare(
+        `DELETE FROM pending_consolidation WHERE id NOT IN
+           (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`
+      ).run();
+    });
+  }
+  /**
+   * Take the oldest queued job, marking it claimed so a concurrent drainer
+   * skips it. A job whose claim is older than `staleAfterMinutes` is offered
+   * again: a drainer that was killed mid-run must not lose the work.
+   */
+  claimPending(staleAfterMinutes = 10) {
+    return this.withLock(() => {
+      const row = this.db.prepare(
+        `SELECT id, payload FROM pending_consolidation
+           WHERE claimed_at IS NULL OR claimed_at < datetime('now', ?)
+           ORDER BY id LIMIT 1`
+      ).get(`-${staleAfterMinutes} minutes`);
+      if (!row) return void 0;
+      this.db.prepare("UPDATE pending_consolidation SET claimed_at = datetime('now') WHERE id = ?").run(row.id);
+      return row;
+    });
+  }
+  /** Drop a job after its facts were written — at-least-once, never silent loss. */
+  deletePending(id) {
+    this.withLock(() => {
+      this.db.prepare("DELETE FROM pending_consolidation WHERE id = ?").run(id);
+    });
+  }
+  /**
+   * Hand a claimed job back to the queue. Used when a drain is interrupted by
+   * shutdown: without it the job would sit claimed until the stale window
+   * expires, so a user who quits mid-consolidation would see a dead queue.
+   */
+  releasePending(id) {
+    this.withLock(() => {
+      this.db.prepare("UPDATE pending_consolidation SET claimed_at = NULL WHERE id = ?").run(id);
+    });
+  }
+  pendingCount() {
+    return this.db.prepare("SELECT COUNT(*) AS c FROM pending_consolidation").get().c;
+  }
   // ─── Stats ───────────────────────────────────────────────────────
   stats() {
     const semantic = this.db.prepare("SELECT COUNT(*) as c FROM semantic").get().c;
     const lessons = this.db.prepare("SELECT COUNT(*) as c FROM lessons WHERE is_deleted = 0").get().c;
     const events = this.db.prepare("SELECT COUNT(*) as c FROM events").get().c;
-    return { semantic, lessons, events };
+    return { semantic, lessons, events, pending: this.pendingCount() };
   }
   close() {
     this.db.close();
@@ -1332,6 +1397,8 @@ function index_default(pi) {
   let cachedCtx = null;
   let resolvedDbPath = DEFAULT_DB_PATH;
   let injectorConfig = readSettingsConfig();
+  let draining = false;
+  let currentJobId = null;
   let embedder = null;
   let embedFailure = null;
   let notifiedReasons = /* @__PURE__ */ new Set();
@@ -1545,54 +1612,80 @@ ${text}` };
       }
     }
   });
-  pi.on("session_before_switch", async (_event, ctx) => {
-    if (!store) return;
-    if (pendingUserMessages.length >= 3) {
-      ctx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
-      try {
-        await consolidateSession();
-      } catch {
-      } finally {
-        try {
-          ctx.ui.setStatus("pi-memory", "");
-        } catch {
-        }
-      }
-    }
-    pendingUserMessages = [];
-    pendingAssistantMessages = [];
+  pi.on("session_before_switch", () => {
+    enqueuePendingTail();
   });
   pi.on("session_shutdown", async () => {
     if (!store) return;
     try {
-      if (cachedCtx && pendingUserMessages.length >= 3) {
-        cachedCtx.ui.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
-      }
-      if (pendingUserMessages.length >= 3) {
-        try {
-          await consolidateSession();
-        } catch {
-        }
-      }
+      enqueuePendingTail();
+      if (currentJobId !== null) store.releasePending(currentJobId);
+    } catch {
     } finally {
-      if (cachedCtx) {
-        try {
-          cachedCtx.ui.setStatus("pi-memory", "");
-        } catch {
-        }
-      }
       store.close();
       store = null;
     }
   });
-  async function consolidateSession() {
+  pi.on("agent_settled", (_event, ctx) => {
+    enqueuePendingTail();
+    void drainPending(ctx);
+  });
+  function enqueuePendingTail() {
+    if (!store || pendingUserMessages.length < 3) return;
+    try {
+      store.enqueuePending({
+        userMessages: pendingUserMessages,
+        assistantMessages: pendingAssistantMessages,
+        cwd: sessionCwd,
+        sessionId
+      });
+    } catch {
+    } finally {
+      pendingUserMessages = [];
+      pendingAssistantMessages = [];
+    }
+  }
+  async function drainPending(ctx) {
+    if (draining) return;
+    draining = true;
+    let showedStatus = false;
+    try {
+      while (store) {
+        let job;
+        try {
+          job = store.claimPending();
+        } catch {
+          return;
+        }
+        if (!job) return;
+        currentJobId = job.id;
+        if (!showedStatus) {
+          showedStatus = true;
+          try {
+            ctx?.ui?.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
+          } catch {
+          }
+        }
+        try {
+          await consolidate(JSON.parse(job.payload));
+          store.deletePending(job.id);
+          currentJobId = null;
+        } catch {
+          return;
+        }
+      }
+    } finally {
+      if (showedStatus) {
+        try {
+          ctx?.ui?.setStatus("pi-memory", "");
+        } catch {
+        }
+      }
+      draining = false;
+    }
+  }
+  async function consolidate(input) {
     if (!store) return;
-    const input = {
-      userMessages: pendingUserMessages,
-      assistantMessages: pendingAssistantMessages,
-      cwd: sessionCwd,
-      sessionId
-    };
     const currentFacts = store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value }));
     const currentLessons = store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category }));
     const prompt = buildConsolidationPrompt(input, currentFacts, currentLessons);
@@ -1611,7 +1704,7 @@ ${text}` };
         injectorConfig.consolidationModel ?? DEFAULT_CONSOLIDATION_MODEL
       ], {
         timeout: EXEC_TIMEOUT_MS,
-        cwd: sessionCwd
+        cwd: input.cwd ?? sessionCwd
       });
       const result = await Promise.race([
         execPromise,
@@ -1624,8 +1717,8 @@ ${text}` };
       ]);
       if (result.code === 0 && result.stdout) {
         const extracted = parseConsolidationResponse(result.stdout);
-        const slug = sessionCwd ? projectSlug(sessionCwd) : void 0;
-        const applied = applyExtracted(store, extracted, `session:${sessionId ?? "unknown"}`, slug || void 0);
+        const slug = input.cwd ? projectSlug(input.cwd) : void 0;
+        const applied = applyExtracted(store, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
         if (applied.semantic + applied.lessons > 0) {
           console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
         }
@@ -1768,6 +1861,9 @@ ${text}` };
         `Memory: ${stats.semantic} semantic facts, ${stats.lessons} active lessons, ${stats.events} events logged`,
         `DB: ${resolvedDbPath}`
       ];
+      if (stats.pending > 0) {
+        lines.push(`Queued: ${stats.pending} unconsolidated session tail(s), processed when the session goes idle`);
+      }
       const cfg = injectorConfig.embedding;
       if (cfg) {
         const cov = store.embeddingCoverage();
@@ -1798,9 +1894,18 @@ ${text}` };
       }
       ctx.ui.notify("Consolidating session memory...", "info");
       try {
-        await consolidateSession();
+        store.enqueuePending({
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          cwd: sessionCwd,
+          sessionId
+        });
+        pendingUserMessages = [];
+        pendingAssistantMessages = [];
+        await drainPending(ctx);
         const stats = store.stats();
-        ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons`, "info");
+        const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";
+        ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons${queued}`, "info");
       } catch (err) {
         ctx.ui.notify(`Consolidation failed: ${err.message}`, "error");
       }

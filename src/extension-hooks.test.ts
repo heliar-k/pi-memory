@@ -216,8 +216,20 @@ describe("per-turn injection through the hooks", () => {
   });
 });
 
-describe("consolidation status", () => {
-  it("session_before_switch consolidates and always clears the status", async () => {
+describe("consolidation off the interaction path", () => {
+  /** Poll the public stats tool until the background drain emptied the queue. */
+  async function waitForDrain(
+    h: ReturnType<typeof createHarness>,
+  ): Promise<string> {
+    for (let i = 0; i < 200; i++) {
+      const text = await h.call("memory_stats", {});
+      if (!text.includes("Queued:")) return text;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+    throw new Error("background drain did not finish");
+  }
+
+  it("a session switch queues the tail; the next idle moment drains it", async () => {
     const h = createHarness({ consolidationModel: "test/model" });
     try {
       await h.handlers.get("session_start")!({}, h.ctx);
@@ -230,14 +242,21 @@ describe("consolidation status", () => {
         },
         h.ctx,
       );
+
+      // Switching must not wait for the model — only the queue write happens.
       await h.handlers.get("session_before_switch")!({}, h.ctx);
-      assert.deepEqual(h.statuses.slice(-2), ["🧠 Consolidating memory...", ""]);
+      assert.equal(h.execCalls.length, 0, "switch must not run the model");
+      assert.match(await h.call("memory_stats", {}), /Queued: 1 /);
+
+      // The idle moment drains it in the background.
+      await h.handlers.get("agent_settled")!({}, h.ctx);
+      const stats = await waitForDrain(h);
       assert.equal(h.execCalls.length, 1);
       assert.ok((h.execCalls[0]![1] as string[]).includes("test/model"));
+      assert.doesNotMatch(stats, /Queued:/);
 
-      // Queue was reset, so shutdown has nothing left to consolidate.
-      await h.handlers.get("session_shutdown")!({}, h.ctx);
-      assert.equal(h.execCalls.length, 1);
+      // Status is only shown while the drain runs, and always cleared.
+      assert.deepEqual(h.statuses.slice(-2), ["🧠 Consolidating memory...", ""]);
     } finally {
       await h.cleanup();
     }

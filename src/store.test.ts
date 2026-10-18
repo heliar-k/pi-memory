@@ -23,6 +23,16 @@ function shadowCount(dbPath: string, table: string): number {
   }
 }
 
+/** Run a statement outside MemoryStore, e.g. to age a queue claim. */
+function execRaw(dbPath: string, sql: string, ...params: unknown[]): void {
+  const db = new DatabaseSync(dbPath);
+  try {
+    db.prepare(sql).run(...params);
+  } finally {
+    db.close();
+  }
+}
+
 describe("MemoryStore", () => {
   let store: MemoryStore;
   let tmpDir: string;
@@ -253,6 +263,72 @@ describe("MemoryStore", () => {
         reopened.close();
       }
       assert.equal(shadowCount(dbPath, "semantic_fts_docsize"), 1);
+    });
+  });
+
+  describe("pending consolidation queue", () => {
+    const dbPath = (name: string) => join(tmpDir, `queue-${name}.db`);
+
+    it("a claimed job is invisible until it is deleted", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending({ userMessages: ["a", "b", "c"], assistantMessages: [] });
+        assert.equal(q.pendingCount(), 1);
+
+        const job = q.claimPending();
+        assert.ok(job);
+        assert.deepEqual(JSON.parse(job!.payload).userMessages, ["a", "b", "c"]);
+
+        // Claimed: a concurrent drainer must not take it as well.
+        assert.equal(q.claimPending(), undefined);
+        assert.equal(q.pendingCount(), 1, "claimed work is never silently dropped");
+
+        q.deletePending(job!.id);
+        assert.equal(q.pendingCount(), 0);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("re-offers a job whose drainer died mid-run", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending({ userMessages: ["x", "y", "z"], assistantMessages: [] });
+        const job = q.claimPending()!;
+        assert.equal(q.claimPending(), undefined);
+
+        // A killed drain leaves the row claimed; after the stale window it is
+        // offered again rather than lost.
+        execRaw(dbPath(t.name), "UPDATE pending_consolidation SET claimed_at = datetime('now', '-11 minutes') WHERE id = ?", job.id);
+        assert.equal(q.claimPending()?.id, job.id);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("stays bounded when drains keep failing", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        for (let i = 0; i < 25; i++) {
+          q.enqueuePending({ userMessages: [`m${i}`], assistantMessages: [] });
+        }
+        assert.equal(q.pendingCount(), 20);
+        // Oldest first, and the five oldest were dropped — not the newest.
+        assert.match(q.claimPending()!.payload, /m5/);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("is reported by stats", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        assert.equal(q.stats().pending, 0);
+        q.enqueuePending({ userMessages: ["a", "b", "c"], assistantMessages: [] });
+        assert.equal(q.stats().pending, 1);
+      } finally {
+        q.close();
+      }
     });
   });
 

@@ -5,6 +5,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 
 import piMemory from "./index.js";
+import { MemoryStore } from "./store.js";
 
 type PiMemoryApi = Parameters<typeof piMemory>[0];
 type TestSessionContext = ReturnType<typeof createSessionContext>["ctx"];
@@ -68,33 +69,46 @@ function createTempProject() {
   return tmpProject;
 }
 
-describe("session_shutdown status", () => {
-  it("clears the consolidating status after shutdown consolidation", async () => {
+/** Conversations the extension considers worth consolidating. */
+const threeTurns = {
+  messages: ["one", "two", "three"].flatMap((n) => [
+    { role: "user", content: `remember preference ${n}` },
+    { role: "assistant", content: "ok" },
+  ]),
+};
+
+function pendingJobs(tmpProject: string): number {
+  const store = new MemoryStore(path.join(tmpProject, "memory", "memory.db"));
+  try {
+    return store.pendingCount();
+  } finally {
+    store.close();
+  }
+}
+
+describe("session_shutdown", () => {
+  it("queues the tail instead of waiting on the consolidation model", async () => {
     const tmpProject = createTempProject();
     try {
       const { handlers, execCalls } = createHarness();
       const { ctx, statuses } = createSessionContext(tmpProject);
 
       await handlers.get("session_start")?.({}, ctx);
-      await handlers.get("agent_end")?.({
-        messages: [
-          { role: "user", content: "remember preference one" },
-          { role: "assistant", content: "ok" },
-          { role: "user", content: "remember preference two" },
-          { role: "assistant", content: "ok" },
-          { role: "user", content: "remember preference three" },
-        ],
-      }, ctx);
+      await handlers.get("agent_end")?.(threeTurns, ctx);
       await handlers.get("session_shutdown")?.({}, ctx);
 
-      assert.deepEqual(statuses.slice(-2), ["🧠 Consolidating memory...", ""]);
-      assert.equal(execCalls.length, 1);
+      // The whole point: quitting never spawns the consolidation subprocess.
+      assert.equal(execCalls.length, 0);
+      assert.ok(!statuses.includes("🧠 Consolidating memory..."));
+
+      // …and nothing is lost: the tail is durable and a later drain picks it up.
+      assert.equal(pendingJobs(tmpProject), 1);
     } finally {
       fs.rmSync(tmpProject, { recursive: true, force: true });
     }
   });
 
-  it("does not show consolidating when there is nothing to consolidate", async () => {
+  it("queues nothing when there is no conversation to consolidate", async () => {
     const tmpProject = createTempProject();
     try {
       const { handlers, execCalls } = createHarness();
@@ -103,9 +117,9 @@ describe("session_shutdown status", () => {
       await handlers.get("session_start")?.({}, ctx);
       await handlers.get("session_shutdown")?.({}, ctx);
 
-      assert.ok(!statuses.includes("🧠 Consolidating memory..."));
-      assert.equal(statuses[statuses.length - 1], "");
       assert.equal(execCalls.length, 0);
+      assert.ok(!statuses.includes("🧠 Consolidating memory..."));
+      assert.equal(pendingJobs(tmpProject), 0);
     } finally {
       fs.rmSync(tmpProject, { recursive: true, force: true });
     }
