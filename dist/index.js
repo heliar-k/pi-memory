@@ -1535,6 +1535,7 @@ function index_default(pi) {
       embedder = null;
       embedFailure = null;
       notifiedReasons = /* @__PURE__ */ new Set();
+      getEmbedder();
       if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
       pendingUserMessages = [];
       pendingAssistantMessages = [];
@@ -1657,7 +1658,6 @@ ${text}` };
       if (currentJobId !== null) store.releasePending(currentJobId);
     } catch {
     } finally {
-      store.close();
       store = null;
     }
   });

@@ -457,10 +457,14 @@ export default function (pi: ExtensionAPI) {
       notifiedReasons = new Set();
       // Deliberately not awaited: startup must not block on a provider call.
       //
-      // Only in long-lived modes, though. An in-flight HTTP request keeps the
-      // event loop alive, so `pi -p` would not exit until the backfill settled —
-      // measured at ~3 s of tail latency on a script that only wanted one answer.
-      // Vectors are an optimisation for `memory_search`; a print run can skip it.
+      // Validate the embedding configuration in every mode: half of #30 is that
+      // a broken provider must never be silently ignored. `getEmbedder()` only
+      // builds the client, so it reports bad config without any I/O.
+      getEmbedder();
+      // The backfill itself only runs where the process lives on. An in-flight
+      // HTTP request keeps the event loop alive, so a print run would not exit
+      // until it settled — measured at ~3 s of tail latency on a script that
+      // only wanted one answer. Vectors only improve `memory_search`.
       if (ctx.mode === "tui" || ctx.mode === "rpc") void backfillEmbeddings(ctx);
 
       // Seed pending messages from existing session history so that
@@ -666,7 +670,13 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Never fail a shutdown over the queue.
     } finally {
-      store.close();
+      // Deliberately NOT closing the store.
+      //
+      // SQLite checkpoints the WAL when the last connection closes, which is
+      // fsync-bound: measured at 140 ms — 1.5 s on a slow disk, on the exact
+      // path where the user is waiting for their shell back. The WAL is
+      // crash-safe, so the next open recovers it without paying the checkpoint;
+      // the process exits either way and the OS closes the descriptor.
       store = null;
     }
   });

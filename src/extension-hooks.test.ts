@@ -48,6 +48,8 @@ function createHarness(memorySettings: Record<string, unknown>) {
 
   const ctx = {
     cwd: project,
+    // tui is the mode where idle-time drains are allowed to run.
+    mode: "tui",
     hasUI: true,
     ui: {
       setStatus: (_key: string, value: string) => void statuses.push(value),
