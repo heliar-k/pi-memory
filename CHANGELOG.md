@@ -2,6 +2,39 @@
 
 All notable changes to `@samfp/pi-memory`. Versions follow [semver](https://semver.org/).
 
+## [Unreleased]
+
+Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
+
+### Changed
+
+- **Consolidation no longer runs while you are waiting.** It used to be awaited
+  in `session_before_switch` and `session_shutdown`, which meant a session
+  switch or a quit blocked on a spawned `pi` child (1.75 s of boot) plus
+  provider latency — measured at 3.9 s end to end. The session tail is now
+  queued into a durable outbox (one commit) and drained on `agent_settled`,
+  when the session is idle. Quitting during a running drain measured 112 ms
+  against a 12 s stand-in child; the interrupted job goes back on the queue and
+  the next session retries it.
+- Per-turn writes are one transaction per fact at `PRAGMA synchronous=NORMAL`
+  instead of the default FULL (85 ms → 13 ms per fact on a slow disk).
+
+### Fixed
+
+- **The FTS indexes are rebuilt only when they are stale.** `migrate()` rebuilt
+  both indexes on every open — ~300 ms per `session_start` / `/new` / `/resume`
+  on a machine with slow commits — even though the triggers keep them current.
+  The guard compares each content table against its `_docsize` shadow table, so
+  a pre-FTS database or a dropped trigger still self-heals.
+- **A resumed session no longer queues its whole history twice.** Every
+  `session_start` re-seeds the tail, so queued jobs are now keyed per session
+  and replace the queued tail only when it carries more messages.
+- **A quit between "facts written" and "job deleted" no longer leaves a job
+  behind.** Both happen in one transaction.
+- **`pi -p` runs no longer keep the process alive for ~3 s after the answer.**
+  The embedding backfill started at `session_start` held the event loop with an
+  in-flight request; it now runs only in `tui`/`rpc` modes.
+
 ## [1.6.1] - 2026-10-09
 
 ### Fixed

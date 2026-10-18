@@ -65,17 +65,20 @@ Or add to `~/.pi/agent/settings.json`:
 2. **`before_agent_start`** — On every user turn, searches memory for entries relevant to the prompt (plus project context for the cwd) and prepares a `<memory>` block.
 3. **`context`** — Splices that block into the request as an ephemeral message just before the latest user message. It is never written to session history.
 4. **`agent_end`** — Collects conversation messages for later consolidation.
-5. **`session_before_switch` / `session_shutdown`** — Runs LLM consolidation (via `pi -p --print`) to extract structured knowledge, then closes the store.
+5. **`agent_settled`** — Queues the tail into a durable outbox and drains it in the background. This is the idle moment: the run has finished, nothing is queued, and a multi-second provider call costs you nothing.
+6. **`session_before_switch` / `session_shutdown`** — Queues the tail (one commit) and returns. Nothing blocks on the model, so switching sessions and quitting stay instant; an interrupted drain is handed back to the queue and retried by the next session.
+
+Print and JSON runs (`pi -p`) exit as soon as the turn ends, so they queue the tail and leave draining to the next interactive session.
 
 ### Consolidation
 
-At session end, if there were ≥3 user messages, the extension sends the conversation to an LLM and asks it to extract:
+Consolidation runs whenever the session goes idle after ≥3 new user messages, or on `/memory-consolidate`. The queued tail is walked through an LLM call that extracts:
 
 - **Preferences** — coding style, workflow habits, tool choices
 - **Project patterns** — languages, frameworks, architecture decisions
 - **Corrections** — things you corrected, mistakes to avoid
 
-Only facts with confidence ≥ 0.8 are stored. Lessons are deduplicated using exact match and Jaccard similarity (≥ 0.7 threshold).
+Only facts with confidence ≥ 0.8 are stored. Lessons are deduplicated using exact match and Jaccard similarity (≥ 0.7 threshold). Extraction and the queue-bookkeeping that consumes it share one transaction, and delivery is at-least-once: a job is deleted only after its facts are written, so a crash mid-run retries it rather than losing it. `memory_stats` reports the queue depth.
 
 ### Injection
 
