@@ -670,13 +670,11 @@ export default function (pi: ExtensionAPI) {
     } catch {
       // Never fail a shutdown over the queue.
     } finally {
-      // Deliberately NOT closing the store.
-      //
-      // SQLite checkpoints the WAL when the last connection closes, which is
-      // fsync-bound: measured at 140 ms — 1.5 s on a slow disk, on the exact
-      // path where the user is waiting for their shell back. The WAL is
-      // crash-safe, so the next open recovers it without paying the checkpoint;
-      // the process exits either way and the OS closes the descriptor.
+      // Closing checkpoints whatever is left in the WAL. It is cheap because
+      // wal_autocheckpoint already flushed most of it during the session —
+      // leaving the file open instead just moves the same work to the next
+      // start, and lets the WAL grow to megabytes.
+      store.close();
       store = null;
     }
   });

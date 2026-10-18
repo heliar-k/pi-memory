@@ -87,6 +87,11 @@ export class MemoryStore {
     // disk, i.e. ~85 ms for a single stored fact — and this store writes in small
     // transactions from the session path.
     this.db.exec("PRAGMA synchronous = NORMAL");
+    // Checkpoint in small slices while the session runs instead of letting the
+    // WAL grow to the 1000-page default: the deferred cost then lands on some
+    // random commit — measured as a 1.3 s stall in the middle of a session —
+    // instead of here. 128 pages ≈ 512 KB.
+    this.db.exec("PRAGMA wal_autocheckpoint = 128");
     this.db.exec("PRAGMA busy_timeout = 5000");
     this.db.exec("PRAGMA foreign_keys = ON");
     this.migrate();
