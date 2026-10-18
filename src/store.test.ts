@@ -268,11 +268,12 @@ describe("MemoryStore", () => {
 
   describe("pending consolidation queue", () => {
     const dbPath = (name: string) => join(tmpDir, `queue-${name}.db`);
+    const tail = (...messages: string[]) => ({ userMessages: messages, assistantMessages: [] });
 
     it("a claimed job is invisible until it is deleted", (t) => {
       const q = new MemoryStore(dbPath(t.name));
       try {
-        q.enqueuePending({ userMessages: ["a", "b", "c"], assistantMessages: [] });
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
         assert.equal(q.pendingCount(), 1);
 
         const job = q.claimPending();
@@ -293,7 +294,7 @@ describe("MemoryStore", () => {
     it("re-offers a job whose drainer died mid-run", (t) => {
       const q = new MemoryStore(dbPath(t.name));
       try {
-        q.enqueuePending({ userMessages: ["x", "y", "z"], assistantMessages: [] });
+        q.enqueuePending("s1", tail("x", "y", "z"), 3);
         const job = q.claimPending()!;
         assert.equal(q.claimPending(), undefined);
 
@@ -306,11 +307,57 @@ describe("MemoryStore", () => {
       }
     });
 
+    it("re-queues a re-seeded tail instead of duplicating it", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        // Every resumed session re-seeds its whole history, so the same tail
+        // arrives again — it must not become a second job.
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
+        assert.equal(q.pendingCount(), 1);
+
+        // A tail that grew replaces the queued one.
+        q.enqueuePending("s1", tail("a", "b", "c", "d"), 4);
+        assert.equal(q.pendingCount(), 1);
+        assert.deepEqual(JSON.parse(q.claimPending()!.payload).userMessages, ["a", "b", "c", "d"]);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("never shrinks a queued tail", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending("s1", tail("a", "b", "c", "d"), 4);
+        // After an in-session drain the buffer restarts empty; a smaller tail
+        // must not replace the fuller one that is still waiting.
+        q.enqueuePending("s1", tail("e"), 1);
+        assert.deepEqual(JSON.parse(q.claimPending()!.payload).userMessages, ["a", "b", "c", "d"]);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("queues a new job when one is already being drained", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
+        const inflight = q.claimPending()!;
+        q.enqueuePending("s1", tail("d", "e", "f"), 3);
+        assert.equal(q.pendingCount(), 2, "in-flight work is never overwritten");
+        const next = q.claimPending()!;
+        assert.notEqual(next.id, inflight.id);
+        assert.deepEqual(JSON.parse(next.payload).userMessages, ["d", "e", "f"]);
+      } finally {
+        q.close();
+      }
+    });
+
     it("stays bounded when drains keep failing", (t) => {
       const q = new MemoryStore(dbPath(t.name));
       try {
         for (let i = 0; i < 25; i++) {
-          q.enqueuePending({ userMessages: [`m${i}`], assistantMessages: [] });
+          q.enqueuePending(`s${i}`, tail(`m${i}`), 1);
         }
         assert.equal(q.pendingCount(), 20);
         // Oldest first, and the five oldest were dropped — not the newest.
@@ -324,8 +371,25 @@ describe("MemoryStore", () => {
       const q = new MemoryStore(dbPath(t.name));
       try {
         assert.equal(q.stats().pending, 0);
-        q.enqueuePending({ userMessages: ["a", "b", "c"], assistantMessages: [] });
+        q.enqueuePending("s1", tail("a", "b", "c"), 3);
         assert.equal(q.stats().pending, 1);
+      } finally {
+        q.close();
+      }
+    });
+
+    it("rolls back work that throws inside a transaction", (t) => {
+      const q = new MemoryStore(dbPath(t.name));
+      try {
+        // Writing facts and dropping their job share one transaction, so a
+        // failure must leave neither.
+        assert.throws(() =>
+          q.transaction(() => {
+            q.setSemantic("pref.rolled_back", "must not persist", 0.9, "user");
+            throw new Error("boom");
+          }),
+        );
+        assert.equal(q.getSemantic("pref.rolled_back"), undefined);
       } finally {
         q.close();
       }

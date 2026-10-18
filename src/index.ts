@@ -81,6 +81,7 @@ import {
   parseConsolidationResponse,
   applyExtracted,
   type ConsolidationInput,
+  type ExtractedMemory,
 } from "./consolidator.js";
 
 /** Package root: dist/ and src/ both sit one level below it. */
@@ -683,12 +684,16 @@ export default function (pi: ExtensionAPI) {
   function enqueuePendingTail(): void {
     if (!store || pendingUserMessages.length < 3) return;
     try {
-      store.enqueuePending({
-        userMessages: pendingUserMessages,
-        assistantMessages: pendingAssistantMessages,
-        cwd: sessionCwd,
-        sessionId,
-      } satisfies ConsolidationInput);
+      store.enqueuePending(
+        `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
+        {
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          cwd: sessionCwd,
+          sessionId,
+        } satisfies ConsolidationInput,
+        pendingUserMessages.length,
+      );
     } catch {
       // Never break the session over a failed enqueue.
     } finally {
@@ -723,9 +728,22 @@ export default function (pi: ExtensionAPI) {
           showedStatus = true;
           try { ctx?.ui?.setStatus("pi-memory", "🧠 Consolidating memory..."); } catch { /* stale ctx */ }
         }
+        const input = JSON.parse(job.payload) as ConsolidationInput;
+        const extracted = await extractFrom(input);
+        if (!store) return;
+        if (!extracted) {
+          // Model unavailable. Drop the job like the old best-effort path did
+          // — retrying a prompt the provider keeps failing only re-burns tokens.
+          try {
+            store.deletePending(job.id);
+            currentJobId = null;
+          } catch {
+            return;
+          }
+          continue;
+        }
         try {
-          await consolidate(JSON.parse(job.payload) as ConsolidationInput);
-          store.deletePending(job.id);
+          applyExtraction(input, extracted, job.id);
           currentJobId = null;
         } catch {
           return; // stays claimed, retried after the stale window
@@ -741,15 +759,18 @@ export default function (pi: ExtensionAPI) {
 
   // ─── Consolidation ──────────────────────────────────────────────
 
-  async function consolidate(input: ConsolidationInput): Promise<void> {
-    if (!store) return;
+  /**
+   * Ask the model what is worth remembering. Returns null when the call failed
+   * — the caller decides what to do with the job, this never throws.
+   */
+  async function extractFrom(input: ConsolidationInput): Promise<ExtractedMemory | null> {
+    if (!store) return null;
 
     const currentFacts = store.listSemantic(undefined, 200).map(f => ({ key: f.key, value: f.value }));
     const currentLessons = store.listLessons(undefined, 100).map(l => ({ rule: l.rule, category: l.category }));
     const prompt = buildConsolidationPrompt(input, currentFacts, currentLessons);
 
     // Use pi's exec to call the LLM via a lightweight pi session.
-    // Use a fast model to avoid blocking shutdown for too long.
     //
     // Defence in depth: pi.exec has a 45s timeout, but we also wrap the
     // whole call in a hard 60s backstop. If pi.exec's timeout ever fails
@@ -781,20 +802,37 @@ export default function (pi: ExtensionAPI) {
         }),
       ]);
 
-      if (result.code === 0 && result.stdout) {
-        const extracted = parseConsolidationResponse(result.stdout);
-        const slug = input.cwd ? projectSlug(input.cwd) : undefined;
-        const applied = applyExtracted(store!, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
-        if (applied.semantic + applied.lessons > 0) {
-          // Background work: log it, don't interrupt the user.
-          console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
-        }
-      }
+      if (result.code !== 0 || !result.stdout) return null;
+      return parseConsolidationResponse(result.stdout);
     } catch {
-      // Timeout or exec failure — skip consolidation this session
+      return null;
     } finally {
       if (backstopHandle) clearTimeout(backstopHandle);
     }
+  }
+
+  /**
+   * Write the extraction and drop its queue job in ONE transaction.
+   *
+   * This is what makes at-least-once safe in practice: a job that has been
+   * applied is gone, and a job that is gone has been applied. Splitting the
+   * two produced observable duplicate work (facts written, job surviving).
+   */
+  function applyExtraction(
+    input: ConsolidationInput,
+    extracted: ExtractedMemory,
+    jobId: number | null,
+  ): void {
+    if (!store) return;
+    const slug = input.cwd ? projectSlug(input.cwd) : undefined;
+    store.transaction(() => {
+      const applied = applyExtracted(store!, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
+      if (jobId !== null) store!.deletePending(jobId);
+      if (applied.semantic + applied.lessons > 0) {
+        // Background work: log it, don't interrupt the user.
+        console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
+      }
+    });
   }
 
   // ─── Tools ──────────────────────────────────────────────────────
@@ -994,12 +1032,16 @@ export default function (pi: ExtensionAPI) {
       try {
         // Go through the queue so a manual run and a background drain cannot
         // consolidate the same tail twice, and so a failure stays retryable.
-        store.enqueuePending({
-          userMessages: pendingUserMessages,
-          assistantMessages: pendingAssistantMessages,
-          cwd: sessionCwd,
-          sessionId,
-        } satisfies ConsolidationInput);
+        store.enqueuePending(
+          `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
+          {
+            userMessages: pendingUserMessages,
+            assistantMessages: pendingAssistantMessages,
+            cwd: sessionCwd,
+            sessionId,
+          } satisfies ConsolidationInput,
+          pendingUserMessages.length,
+        );
         pendingUserMessages = [];
         pendingAssistantMessages = [];
         await drainPending(ctx);

@@ -72,6 +72,9 @@ export class MemoryStore {
   private db: InstanceType<typeof DatabaseSync>;
   private writeLock: Promise<void> = Promise.resolve();
   private hasFTS5: boolean = false;
+  // Non-zero while a transaction is open, so nested calls join it instead of
+  // starting a second BEGIN (which SQLite rejects).
+  private txDepth: number = 0;
 
   constructor(dbPath: string) {
     const dir = dirname(dbPath);
@@ -124,11 +127,29 @@ export class MemoryStore {
       -- interaction path.
       CREATE TABLE IF NOT EXISTS pending_consolidation (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        user_count INTEGER NOT NULL DEFAULT 0,
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         claimed_at TEXT
       );
     `);
+
+    // Migration: the first outbox shipped without session_id/user_count.
+    for (const column of ["session_id TEXT", "user_count INTEGER NOT NULL DEFAULT 0"]) {
+      try {
+        this.db.exec(`ALTER TABLE pending_consolidation ADD COLUMN ${column}`);
+      } catch {
+        // Column already there.
+      }
+    }
+    // At most one queued (unclaimed) job per session: a resumed session re-seeds
+    // its whole history on every start, and without this the queue grew one
+    // duplicate job per run. A claimed job is mid-flight and stays untouched.
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS pending_session
+         ON pending_consolidation(session_id) WHERE claimed_at IS NULL`,
+    );
 
     // Migration: add last_accessed column if missing
     try {
@@ -222,11 +243,19 @@ export class MemoryStore {
   /**
    * Serialize async callers so concurrent read-modify-write cycles
    * (e.g. two consolidation calls) don't clobber each other.
+   *
+   * Re-entrant: a `transaction()` block may call methods that take the lock
+   * themselves, which is how writing facts and dropping their queue job stay
+   * atomic without every caller knowing about the outer transaction.
    */
   private withLock<T>(fn: () => T): T {
+    // Already inside a transaction: the outer commit covers this work.
+    if (this.txDepth > 0) return fn();
+
     // DatabaseSync is synchronous, so we just need to ensure
     // transactional integrity. Wrap in a SQLite transaction.
     this.db.exec("BEGIN IMMEDIATE");
+    this.txDepth = 1;
     try {
       const result = fn();
       this.db.exec("COMMIT");
@@ -234,7 +263,14 @@ export class MemoryStore {
     } catch (err) {
       this.db.exec("ROLLBACK");
       throw err;
+    } finally {
+      this.txDepth = 0;
     }
+  }
+
+  /** Run several operations atomically (e.g. write facts and drop their job). */
+  transaction<T>(fn: () => T): T {
+    return this.withLock(fn);
   }
 
   // ─── Semantic ────────────────────────────────────────────────────
@@ -605,12 +641,22 @@ export class MemoryStore {
    * One commit: ~13 ms at synchronous=NORMAL, against the several seconds a
    * consolidation run costs. That is the whole point — the expensive part
    * must not run while the user is waiting to quit or switch sessions.
-   * Bounded: an outage keeps at most the newest 20 jobs.
+   *
+   * Keyed per session: re-seeding the same history (every resumed session does)
+   * replaces the queued tail only if it carries more messages, so the queue
+   * cannot grow one duplicate job per run. Bounded to the newest 20 sessions.
    */
-  enqueuePending(payload: unknown): void {
+  enqueuePending(sessionId: string | undefined, payload: unknown, userCount: number): void {
     const json = JSON.stringify(payload);
     this.withLock(() => {
-      this.db.prepare("INSERT INTO pending_consolidation (payload) VALUES (?)").run(json);
+      this.db
+        .prepare(
+          `INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)
+           ON CONFLICT(session_id) WHERE claimed_at IS NULL
+           DO UPDATE SET payload = excluded.payload, user_count = excluded.user_count
+           WHERE excluded.user_count > pending_consolidation.user_count`,
+        )
+        .run(sessionId ?? null, userCount, json);
       this.db.prepare(
         `DELETE FROM pending_consolidation WHERE id NOT IN
            (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`,

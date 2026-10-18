@@ -43,6 +43,9 @@ var MemoryStore = class {
   db;
   writeLock = Promise.resolve();
   hasFTS5 = false;
+  // Non-zero while a transaction is open, so nested calls join it instead of
+  // starting a second BEGIN (which SQLite rejects).
+  txDepth = 0;
   constructor(dbPath) {
     const dir = dirname(dbPath);
     if (!existsSync(dir)) mkdirSync(dir, { recursive: true });
@@ -88,11 +91,23 @@ var MemoryStore = class {
       -- interaction path.
       CREATE TABLE IF NOT EXISTS pending_consolidation (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
+        session_id TEXT,
+        user_count INTEGER NOT NULL DEFAULT 0,
         payload TEXT NOT NULL,
         created_at TEXT NOT NULL DEFAULT (datetime('now')),
         claimed_at TEXT
       );
     `);
+    for (const column of ["session_id TEXT", "user_count INTEGER NOT NULL DEFAULT 0"]) {
+      try {
+        this.db.exec(`ALTER TABLE pending_consolidation ADD COLUMN ${column}`);
+      } catch {
+      }
+    }
+    this.db.exec(
+      `CREATE UNIQUE INDEX IF NOT EXISTS pending_session
+         ON pending_consolidation(session_id) WHERE claimed_at IS NULL`
+    );
     try {
       this.db.exec(`ALTER TABLE semantic ADD COLUMN last_accessed TEXT`);
     } catch {
@@ -158,9 +173,15 @@ var MemoryStore = class {
   /**
    * Serialize async callers so concurrent read-modify-write cycles
    * (e.g. two consolidation calls) don't clobber each other.
+   *
+   * Re-entrant: a `transaction()` block may call methods that take the lock
+   * themselves, which is how writing facts and dropping their queue job stay
+   * atomic without every caller knowing about the outer transaction.
    */
   withLock(fn) {
+    if (this.txDepth > 0) return fn();
     this.db.exec("BEGIN IMMEDIATE");
+    this.txDepth = 1;
     try {
       const result = fn();
       this.db.exec("COMMIT");
@@ -168,7 +189,13 @@ var MemoryStore = class {
     } catch (err) {
       this.db.exec("ROLLBACK");
       throw err;
+    } finally {
+      this.txDepth = 0;
     }
+  }
+  /** Run several operations atomically (e.g. write facts and drop their job). */
+  transaction(fn) {
+    return this.withLock(fn);
   }
   // ─── Semantic ────────────────────────────────────────────────────
   getSemantic(key) {
@@ -452,12 +479,20 @@ var MemoryStore = class {
    * One commit: ~13 ms at synchronous=NORMAL, against the several seconds a
    * consolidation run costs. That is the whole point — the expensive part
    * must not run while the user is waiting to quit or switch sessions.
-   * Bounded: an outage keeps at most the newest 20 jobs.
+   *
+   * Keyed per session: re-seeding the same history (every resumed session does)
+   * replaces the queued tail only if it carries more messages, so the queue
+   * cannot grow one duplicate job per run. Bounded to the newest 20 sessions.
    */
-  enqueuePending(payload) {
+  enqueuePending(sessionId, payload, userCount) {
     const json = JSON.stringify(payload);
     this.withLock(() => {
-      this.db.prepare("INSERT INTO pending_consolidation (payload) VALUES (?)").run(json);
+      this.db.prepare(
+        `INSERT INTO pending_consolidation (session_id, user_count, payload) VALUES (?, ?, ?)
+           ON CONFLICT(session_id) WHERE claimed_at IS NULL
+           DO UPDATE SET payload = excluded.payload, user_count = excluded.user_count
+           WHERE excluded.user_count > pending_consolidation.user_count`
+      ).run(sessionId ?? null, userCount, json);
       this.db.prepare(
         `DELETE FROM pending_consolidation WHERE id NOT IN
            (SELECT id FROM pending_consolidation ORDER BY id DESC LIMIT 20)`
@@ -1633,12 +1668,16 @@ ${text}` };
   function enqueuePendingTail() {
     if (!store || pendingUserMessages.length < 3) return;
     try {
-      store.enqueuePending({
-        userMessages: pendingUserMessages,
-        assistantMessages: pendingAssistantMessages,
-        cwd: sessionCwd,
-        sessionId
-      });
+      store.enqueuePending(
+        `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
+        {
+          userMessages: pendingUserMessages,
+          assistantMessages: pendingAssistantMessages,
+          cwd: sessionCwd,
+          sessionId
+        },
+        pendingUserMessages.length
+      );
     } catch {
     } finally {
       pendingUserMessages = [];
@@ -1666,9 +1705,20 @@ ${text}` };
           } catch {
           }
         }
+        const input = JSON.parse(job.payload);
+        const extracted = await extractFrom(input);
+        if (!store) return;
+        if (!extracted) {
+          try {
+            store.deletePending(job.id);
+            currentJobId = null;
+          } catch {
+            return;
+          }
+          continue;
+        }
         try {
-          await consolidate(JSON.parse(job.payload));
-          store.deletePending(job.id);
+          applyExtraction(input, extracted, job.id);
           currentJobId = null;
         } catch {
           return;
@@ -1684,8 +1734,8 @@ ${text}` };
       draining = false;
     }
   }
-  async function consolidate(input) {
-    if (!store) return;
+  async function extractFrom(input) {
+    if (!store) return null;
     const currentFacts = store.listSemantic(void 0, 200).map((f) => ({ key: f.key, value: f.value }));
     const currentLessons = store.listLessons(void 0, 100).map((l) => ({ rule: l.rule, category: l.category }));
     const prompt = buildConsolidationPrompt(input, currentFacts, currentLessons);
@@ -1715,18 +1765,24 @@ ${text}` };
           );
         })
       ]);
-      if (result.code === 0 && result.stdout) {
-        const extracted = parseConsolidationResponse(result.stdout);
-        const slug = input.cwd ? projectSlug(input.cwd) : void 0;
-        const applied = applyExtracted(store, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
-        if (applied.semantic + applied.lessons > 0) {
-          console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
-        }
-      }
+      if (result.code !== 0 || !result.stdout) return null;
+      return parseConsolidationResponse(result.stdout);
     } catch {
+      return null;
     } finally {
       if (backstopHandle) clearTimeout(backstopHandle);
     }
+  }
+  function applyExtraction(input, extracted, jobId) {
+    if (!store) return;
+    const slug = input.cwd ? projectSlug(input.cwd) : void 0;
+    store.transaction(() => {
+      const applied = applyExtracted(store, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
+      if (jobId !== null) store.deletePending(jobId);
+      if (applied.semantic + applied.lessons > 0) {
+        console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
+      }
+    });
   }
   pi.registerTool({
     name: "memory_search",
@@ -1894,12 +1950,16 @@ ${text}` };
       }
       ctx.ui.notify("Consolidating session memory...", "info");
       try {
-        store.enqueuePending({
-          userMessages: pendingUserMessages,
-          assistantMessages: pendingAssistantMessages,
-          cwd: sessionCwd,
-          sessionId
-        });
+        store.enqueuePending(
+          `${sessionId ?? "unknown"}:${resolvedDbPath}:${sessionCwd}`,
+          {
+            userMessages: pendingUserMessages,
+            assistantMessages: pendingAssistantMessages,
+            cwd: sessionCwd,
+            sessionId
+          },
+          pendingUserMessages.length
+        );
         pendingUserMessages = [];
         pendingAssistantMessages = [];
         await drainPending(ctx);
