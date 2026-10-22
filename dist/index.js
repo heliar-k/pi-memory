@@ -1,8 +1,8 @@
 // src/index.ts
 import { Type } from "typebox";
-import { join, resolve } from "node:path";
+import { join as join2, resolve, dirname as dirname3 } from "node:path";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { existsSync as existsSync2, readFileSync as readFileSync2 } from "node:fs";
 import { fileURLToPath } from "node:url";
 
 // src/store.ts
@@ -117,6 +117,10 @@ var MemoryStore = class {
     } catch {
     }
     try {
+      this.db.exec(`ALTER TABLE semantic ADD COLUMN session_id TEXT`);
+    } catch {
+    }
+    try {
       this.db.exec(`ALTER TABLE lessons ADD COLUMN project TEXT`);
     } catch {
     }
@@ -214,20 +218,25 @@ var MemoryStore = class {
     const normalized = key.toLowerCase();
     return this.db.prepare("SELECT * FROM semantic WHERE key = ?").get(normalized);
   }
-  setSemantic(key, value, confidence = 0.8, source = "consolidation") {
+  setSemantic(key, value, confidence = 0.8, source = "consolidation", sessionId) {
     const normalized = key.toLowerCase();
     this.withLock(() => {
       const existing = this.db.prepare("SELECT * FROM semantic WHERE key = ?").get(normalized);
       if (existing && existing.confidence > confidence) return;
       this.db.prepare(`
-        INSERT INTO semantic (key, value, confidence, source, updated_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
+        INSERT INTO semantic (key, value, confidence, source, session_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(key) DO UPDATE SET
           value = excluded.value,
           confidence = excluded.confidence,
           source = excluded.source,
+          session_id = COALESCE(excluded.session_id, semantic.session_id),
+          -- A changed value invalidates its vector: an embedding of the old
+          -- text would keep ranking this fact for queries it no longer
+          -- answers. NULL makes the backfill re-embed it.
+          embedding = CASE WHEN excluded.value = semantic.value THEN semantic.embedding ELSE NULL END,
           updated_at = datetime('now')
-      `).run(normalized, value, confidence, source);
+      `).run(normalized, value, confidence, source, sessionId ?? null);
       this.logEvent(existing ? "update" : "create", "semantic", normalized);
     });
   }
@@ -332,14 +341,29 @@ var MemoryStore = class {
     }
     return this.db.prepare("SELECT * FROM semantic ORDER BY updated_at DESC LIMIT ?").all(limit);
   }
+  /**
+   * Search facts by relevance to a query.
+   *
+   * Two paths, chosen by the query's script:
+   *
+   * - Latin queries use FTS5 BM25.
+   * - Queries containing CJK use substring scoring over the fact table. FTS5
+   *   ships no CJK segmenter, so a run of Chinese characters is indexed as ONE
+   *   token: `术语` matches 0 rows in a store whose value contains it, and no
+   *   phrase query recovers an interior substring. Substring scoring is the
+   *   only option that needs no segmentation dependency, and the table is
+   *   small enough (thousands of rows at most) that a scan is cheaper than
+   *   the workarounds.
+   */
   searchSemantic(query, limit = 10) {
-    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const terms = queryTerms(query);
     if (terms.length === 0) return [];
-    if (!this.hasFTS5) return this._searchSemanticFallback(query, limit);
+    if (terms.some(containsCjk)) return this._searchSemanticSubstring(terms, limit);
+    if (!this.hasFTS5) return this._searchSemanticSubstring(terms, limit);
     const ftsQuery = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
     try {
       const rows = this.db.prepare(`
-        SELECT s.key, s.value, s.confidence, s.source, s.created_at, s.updated_at, s.last_accessed
+        SELECT s.key, s.value, s.confidence, s.source, s.session_id, s.created_at, s.updated_at, s.last_accessed
         FROM semantic s
         JOIN semantic_fts fts ON s.rowid = fts.rowid
         WHERE semantic_fts MATCH ?
@@ -347,27 +371,42 @@ var MemoryStore = class {
         LIMIT ?
       `).all(ftsQuery, limit);
       if (rows.length > 0) return rows;
-      return this._searchSemanticFallback(query, limit);
+      return this._searchSemanticSubstring(terms, limit);
     } catch {
-      return this._searchSemanticFallback(query, limit);
+      return this._searchSemanticSubstring(terms, limit);
     }
   }
-  _searchSemanticFallback(query, limit) {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return [];
+  _searchSemanticSubstring(terms, limit) {
     const all = this.db.prepare("SELECT * FROM semantic").all();
-    return all.map((entry) => {
+    const scored = [];
+    for (const entry of all) {
       const text = `${entry.key} ${entry.value}`.toLowerCase();
-      const matches = terms.filter((t) => text.includes(t)).length;
-      return { entry, score: matches / terms.length };
-    }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map(({ entry }) => entry);
+      let matched = 0;
+      let hits = 0;
+      for (const term of terms) {
+        const n = countOccurrences(text, term);
+        if (n > 0) {
+          matched++;
+          hits += n;
+        }
+      }
+      if (matched === 0) continue;
+      scored.push({ entry, score: matched / terms.length, hits });
+    }
+    scored.sort((a, b) => b.score - a.score || b.hits - a.hits);
+    return scored.slice(0, limit).map((s) => s.entry);
   }
+  /**
+   * Record that these facts were injected. One statement for the whole set:
+   * the previous per-key loop issued a write per fact per turn, and this runs
+   * on every turn.
+   */
   touchAccessed(keys) {
     if (keys.length === 0) return;
-    const stmt = this.db.prepare("UPDATE semantic SET last_accessed = datetime('now') WHERE key = ?");
-    for (const key of keys) {
-      stmt.run(key.toLowerCase());
-    }
+    const placeholders = keys.map(() => "?").join(",");
+    this.db.prepare(
+      `UPDATE semantic SET last_accessed = datetime('now') WHERE key IN (${placeholders})`
+    ).run(...keys.map((k) => k.toLowerCase()));
   }
   // ─── Lessons ─────────────────────────────────────────────────────
   addLesson(rule, category = "general", source = "consolidation", negative = false, project) {
@@ -426,13 +465,14 @@ var MemoryStore = class {
     return rows.map((r) => ({ ...r, negative: !!r.negative, project: r.project ?? null }));
   }
   /**
-   * Search lessons by relevance to a query. Uses FTS5 when available,
-   * falls back to substring matching. Returns lessons ranked by relevance.
+   * Search lessons by relevance to a query. Same script-based split as
+   * searchSemantic: FTS5 cannot match an interior CJK substring.
    */
   searchLessons(query, limit = 20) {
-    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const terms = queryTerms(query);
     if (terms.length === 0) return [];
-    if (!this.hasFTS5) return this._searchLessonsFallback(query, limit);
+    if (terms.some(containsCjk)) return this._searchLessonsSubstring(terms, limit);
+    if (!this.hasFTS5) return this._searchLessonsSubstring(terms, limit);
     const ftsQuery = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
     try {
       const rows = this.db.prepare(`
@@ -445,20 +485,34 @@ var MemoryStore = class {
       `).all(ftsQuery, limit);
       const mapped = rows.map((r) => ({ ...r, negative: !!r.negative, project: r.project ?? null }));
       if (mapped.length > 0) return mapped;
-      return this._searchLessonsFallback(query, limit);
+      return this._searchLessonsSubstring(terms, limit);
     } catch {
-      return this._searchLessonsFallback(query, limit);
+      return this._searchLessonsSubstring(terms, limit);
     }
   }
-  _searchLessonsFallback(query, limit) {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return [];
+  _searchLessonsSubstring(terms, limit) {
     const all = this.db.prepare("SELECT * FROM lessons WHERE is_deleted = 0").all();
-    return all.map((entry) => {
+    const scored = [];
+    for (const entry of all) {
       const text = `${entry.rule} ${entry.category}`.toLowerCase();
-      const matches = terms.filter((t) => text.includes(t)).length;
-      return { entry: { ...entry, negative: !!entry.negative, project: entry.project ?? null }, score: matches / terms.length };
-    }).filter(({ score }) => score > 0).sort((a, b) => b.score - a.score).slice(0, limit).map(({ entry }) => entry);
+      let matched = 0;
+      let hits = 0;
+      for (const term of terms) {
+        const n = countOccurrences(text, term);
+        if (n > 0) {
+          matched++;
+          hits += n;
+        }
+      }
+      if (matched === 0) continue;
+      scored.push({
+        entry: { ...entry, negative: !!entry.negative, project: entry.project ?? null },
+        score: matched / terms.length,
+        hits
+      });
+    }
+    scored.sort((a, b) => b.score - a.score || b.hits - a.hits);
+    return scored.slice(0, limit).map((s) => s.entry);
   }
   deleteLesson(id) {
     return this.withLock(() => {
@@ -590,6 +644,37 @@ var MemoryStore = class {
     this.db.close();
   }
 };
+var CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+function containsCjk(s) {
+  return CJK_RE.test(s);
+}
+function queryTerms(query) {
+  const terms = /* @__PURE__ */ new Set();
+  for (const word of query.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
+    if (!word) continue;
+    if (!containsCjk(word)) {
+      terms.add(word);
+      continue;
+    }
+    const chars = Array.from(word);
+    if (chars.length === 1) {
+      terms.add(chars[0]);
+      continue;
+    }
+    for (let i = 0; i < chars.length - 1; i++) terms.add(chars[i] + chars[i + 1]);
+  }
+  return [...terms].filter((t) => t.length > 1 || containsCjk(t));
+}
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let count = 0;
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {
+    count++;
+    at = haystack.indexOf(needle, at + needle.length);
+  }
+  return count;
+}
 function jaccard(a, b) {
   const setA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));
   const setB = new Set(b.toLowerCase().split(/\s+/).filter(Boolean));
@@ -604,22 +689,30 @@ import os from "node:os";
 var MAX_CONTEXT_CHARS = 8e3;
 var SEARCH_LIMIT = 15;
 var LESSON_SEARCH_LIMIT = 15;
+var SECTION_ORDER = [
+  "User Preferences",
+  "Project Context",
+  "Tool Preferences",
+  "Relevant Memory",
+  "Learned Corrections",
+  "Validated Approaches",
+  "User"
+];
 var CONSOLIDATION_THINKING_LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
-async function buildContextBlock(store, cwd, prompt, config) {
+async function buildContextBlock(store, cwd, prompt, config, deps) {
   if (prompt?.trim()) {
-    return buildSelectiveBlock(store, prompt, cwd, config);
+    return buildSelectiveBlock(store, prompt, cwd, config, deps);
   }
   return buildFallbackBlock(store, cwd);
 }
-async function buildSelectiveBlock(store, prompt, cwd, config) {
-  const sections = [];
-  let semanticCount = 0;
-  let lessonCount = 0;
+async function buildSelectiveBlock(store, prompt, cwd, config, deps) {
+  const items = [];
   const mode = config?.lessonInjection ?? "all";
-  const results = store.searchSemantic(prompt, SEARCH_LIMIT);
+  const searchFacts = deps?.searchFacts ?? ((q, l) => Promise.resolve(store.searchSemantic(q, l)));
+  const results = await searchFacts(prompt, SEARCH_LIMIT);
   const slug = cwd ? projectSlug(cwd) : "";
   if (slug) {
-    const projectResults = store.searchSemantic(slug, 5);
+    const projectResults = await searchFacts(slug, 5);
     const seen2 = new Set(results.map((r) => r.key));
     for (const r of projectResults) {
       if (!seen2.has(r.key)) {
@@ -646,41 +739,39 @@ async function buildSelectiveBlock(store, prompt, cwd, config) {
       }
     }
   }
+  filteredResults.forEach((entry, rank) => {
+    items.push({
+      section: "Relevant Memory",
+      line: formatSemantic(entry),
+      score: factScore(entry, rank),
+      idx: items.length,
+      kind: "semantic"
+    });
+  });
   if (filteredResults.length > 0) {
-    sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
-    semanticCount = filteredResults.length;
     store.touchAccessed(filteredResults.map((r) => r.key));
   }
   const lessons = mode === "selective" ? getRelevantLessons(store, prompt, cwd) : store.listLessons(void 0, 50, slug || void 0);
-  if (lessons.length > 0) {
-    const corrections = lessons.filter((l) => l.negative);
-    const positives = lessons.filter((l) => !l.negative);
-    if (corrections.length > 0) {
-      const formatted = corrections.map(
-        (l) => `DON'T: ${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Learned Corrections", formatted));
-    }
-    if (positives.length > 0) {
-      const formatted = positives.map(
-        (l) => `${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Validated Approaches", formatted));
-    }
-    lessonCount = lessons.length;
-  }
-  if (sections.length === 0) {
-    return { text: "", stats: { semantic: 0, lessons: 0 } };
-  }
-  let text = `<memory>
-${sections.join("\n")}
-
-${MEMORY_DRIFT_CAVEAT}
-</memory>`;
-  if (text.length > MAX_CONTEXT_CHARS) {
-    text = text.slice(0, MAX_CONTEXT_CHARS - 20) + "\n... (truncated)\n</memory>";
-  }
-  return { text, stats: { semantic: semanticCount, lessons: lessonCount } };
+  lessons.forEach((lesson, rank) => {
+    items.push({
+      section: lesson.negative ? "Learned Corrections" : "Validated Approaches",
+      line: lesson.negative ? `DON'T: ${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}` : `${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`,
+      score: lessonScore(rank),
+      idx: items.length,
+      kind: "lesson"
+    });
+  });
+  const user = store.listSemantic("user.", 10);
+  user.forEach((entry, rank) => {
+    items.push({
+      section: "User",
+      line: formatSemantic(entry),
+      score: factScore(entry, rank),
+      idx: items.length,
+      kind: "semantic"
+    });
+  });
+  return renderBlock(items);
 }
 function getRelevantLessons(store, prompt, cwd) {
   const seen = /* @__PURE__ */ new Set();
@@ -702,64 +793,88 @@ function getRelevantLessons(store, prompt, cwd) {
   return result.slice(0, LESSON_SEARCH_LIMIT);
 }
 function buildFallbackBlock(store, cwd) {
-  const sections = [];
-  let semanticCount = 0;
-  let lessonCount = 0;
-  const prefs = store.listSemantic("pref.", 50);
-  if (prefs.length > 0) {
-    sections.push(formatSection("User Preferences", prefs.map(formatSemantic)));
-    semanticCount += prefs.length;
-  }
-  const projects = store.listSemantic("project.", 50);
+  const items = [];
+  const push = (section, entries, kind = "semantic") => {
+    entries.forEach((entry, rank) => {
+      items.push({
+        section,
+        line: formatSemantic(entry),
+        score: factScore(entry, rank),
+        idx: items.length,
+        kind
+      });
+    });
+  };
+  push("User Preferences", store.listSemantic("pref.", 50));
   const slug = cwd ? projectSlug(cwd) : "";
+  const projects = store.listSemantic("project.", 50);
   const relevant = slug ? projects.filter((p) => {
     const parts = p.key.split(".");
     return parts.length >= 2 && parts[1] === slug;
   }) : projects;
-  if (relevant.length > 0) {
-    sections.push(formatSection("Project Context", relevant.map(formatSemantic)));
-    semanticCount += relevant.length;
+  push("Project Context", relevant);
+  push("Tool Preferences", store.listSemantic("tool.", 20));
+  store.listLessons(void 0, 50, slug || void 0).forEach((lesson, rank) => {
+    items.push({
+      section: lesson.negative ? "Learned Corrections" : "Validated Approaches",
+      line: lesson.negative ? `DON'T: ${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}` : `${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`,
+      score: lessonScore(rank),
+      idx: items.length,
+      kind: "lesson"
+    });
+  });
+  push("User", store.listSemantic("user.", 10));
+  return renderBlock(items);
+}
+function factScore(entry, rank) {
+  const base = 1 / (1 + rank);
+  const confidence = 0.6 + 0.4 * entry.confidence;
+  const stale = daysSince(entry.updated_at) >= VERY_STALE_DAYS ? 0.5 : 1;
+  const usedRecently = entry.last_accessed && daysSince(entry.last_accessed) <= 7 ? 1.2 : 1;
+  return base * confidence * stale * usedRecently;
+}
+function lessonScore(rank) {
+  return 1.25 / (1 + rank);
+}
+function renderBlock(items) {
+  if (items.length === 0) return { text: "", stats: { semantic: 0, lessons: 0 } };
+  const overhead = "<memory>\n".length + "\n\n".length + MEMORY_DRIFT_CAVEAT.length + "\n</memory>".length;
+  let budget = MAX_CONTEXT_CHARS - overhead;
+  const kept = /* @__PURE__ */ new Set();
+  const sectionsStarted = /* @__PURE__ */ new Set();
+  for (const item of [...items].sort((a, b) => b.score - a.score)) {
+    const headerCost = sectionsStarted.has(item.section) ? 0 : item.section.length + 4;
+    const cost = item.line.length + 3;
+    if (cost + headerCost > budget) continue;
+    budget -= cost + headerCost;
+    sectionsStarted.add(item.section);
+    kept.add(item);
   }
-  const tools = store.listSemantic("tool.", 20);
-  if (tools.length > 0) {
-    sections.push(formatSection("Tool Preferences", tools.map(formatSemantic)));
-    semanticCount += tools.length;
+  if (kept.size === 0) return { text: "", stats: { semantic: 0, lessons: 0 } };
+  const bySection = /* @__PURE__ */ new Map();
+  for (const item of [...items].sort((a, b) => a.idx - b.idx)) {
+    if (!kept.has(item)) continue;
+    const lines = bySection.get(item.section) ?? [];
+    lines.push(item.line);
+    bySection.set(item.section, lines);
   }
-  const lessons = store.listLessons(void 0, 50, slug || void 0);
-  if (lessons.length > 0) {
-    const corrections = lessons.filter((l) => l.negative);
-    const positives = lessons.filter((l) => !l.negative);
-    if (corrections.length > 0) {
-      const formatted = corrections.map(
-        (l) => `DON'T: ${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Learned Corrections", formatted));
-    }
-    if (positives.length > 0) {
-      const formatted = positives.map(
-        (l) => `${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Validated Approaches", formatted));
-    }
-    lessonCount = lessons.length;
+  const rendered = SECTION_ORDER.filter((section) => bySection.has(section)).map((section) => formatSection(section, bySection.get(section)));
+  for (const [section, lines] of bySection) {
+    if (!SECTION_ORDER.includes(section)) rendered.push(formatSection(section, lines));
   }
-  const user = store.listSemantic("user.", 10);
-  if (user.length > 0) {
-    sections.push(formatSection("User", user.map(formatSemantic)));
-    semanticCount += user.length;
-  }
-  if (sections.length === 0) {
-    return { text: "", stats: { semantic: 0, lessons: 0 } };
-  }
-  let text = `<memory>
-${sections.join("\n")}
+  const text = `<memory>
+${rendered.join("\n")}
 
 ${MEMORY_DRIFT_CAVEAT}
 </memory>`;
-  if (text.length > MAX_CONTEXT_CHARS) {
-    text = text.slice(0, MAX_CONTEXT_CHARS - 20) + "\n... (truncated)\n</memory>";
-  }
-  return { text, stats: { semantic: semanticCount, lessons: lessonCount } };
+  const keptItems = items.filter((item) => kept.has(item));
+  return {
+    text,
+    stats: {
+      semantic: keptItems.filter((item) => item.kind === "semantic").length,
+      lessons: keptItems.filter((item) => item.kind === "lesson").length
+    }
+  };
 }
 var STALE_WARNING_DAYS = 30;
 var VERY_STALE_DAYS = 90;
@@ -797,6 +912,228 @@ function projectSlug(cwd) {
     if (!skip.has(p.toLowerCase()) && p.length > 1) return p.toLowerCase();
   }
   return "";
+}
+
+// src/sessions.ts
+import { createRequire as createRequire2 } from "node:module";
+import { mkdirSync as mkdirSync2, readdirSync, readFileSync, statSync } from "node:fs";
+import { dirname as dirname2, join } from "node:path";
+var _require2 = createRequire2(import.meta.url);
+var isBun2 = typeof globalThis.Bun !== "undefined";
+var DatabaseSync2 = isBun2 ? _require2("bun:sqlite").Database : _require2("node:sqlite").DatabaseSync;
+var MAX_DOC_CHARS = 8e3;
+var DEFAULT_SYNC_BYTES = 32 * 1024 * 1024;
+function sessionDirFor(sessionsRoot, cwd) {
+  const safe = `--${cwd.replace(/^[/\\]/, "").replace(/[/\\:]/g, "-")}--`;
+  return join(sessionsRoot, safe);
+}
+var SessionIndex = class {
+  db;
+  hasFTS5 = false;
+  constructor(dbPath) {
+    mkdirSync2(dirname2(dbPath), { recursive: true });
+    this.db = new DatabaseSync2(dbPath);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA busy_timeout = 5000");
+    this.migrate();
+  }
+  migrate() {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS files (
+        path TEXT PRIMARY KEY,
+        size INTEGER NOT NULL,
+        mtime INTEGER NOT NULL,
+        session_id TEXT NOT NULL,
+        updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+      );
+    `);
+    try {
+      this.db.exec(`
+        CREATE VIRTUAL TABLE IF NOT EXISTS docs USING fts5(
+          text,
+          session_id UNINDEXED,
+          seq UNINDEXED,
+          role UNINDEXED,
+          ts UNINDEXED,
+          tokenize = 'trigram'
+        );
+      `);
+      this.hasFTS5 = true;
+    } catch {
+      this.hasFTS5 = false;
+    }
+  }
+  /**
+   * Bring the index up to date for one working directory.
+   *
+   * Only this cwd's transcripts are indexed — the same exact-match scoping the
+   * tools use, so a session from another project can never surface here. Files
+   * are visited newest-first and the byte budget is per call, so the first
+   * search in a large project returns partial results instead of blocking.
+   */
+  sync(sessionsRoot, cwd, maxBytes = DEFAULT_SYNC_BYTES) {
+    if (!this.hasFTS5) return { indexed: 0, stale: 0 };
+    const dir = sessionDirFor(sessionsRoot, cwd);
+    let names;
+    try {
+      names = readdirSync(dir).filter((name) => name.endsWith(".jsonl"));
+    } catch {
+      return { indexed: 0, stale: 0 };
+    }
+    const files = names.map((name) => {
+      const path = join(dir, name);
+      try {
+        const st = statSync(path);
+        return { path, size: st.size, mtime: Math.floor(st.mtimeMs) };
+      } catch {
+        return null;
+      }
+    }).filter((f) => f !== null).sort((a, b) => b.mtime - a.mtime);
+    const seen = new Set(files.map((f) => f.path));
+    let budget = maxBytes;
+    let indexed = 0;
+    for (const file of files) {
+      const row = this.db.prepare("SELECT size, mtime FROM files WHERE path = ?").get(file.path);
+      if (row && row.size === file.size && row.mtime === file.mtime) continue;
+      if (file.size > budget && indexed > 0) continue;
+      budget -= file.size;
+      this.indexFile(file.path, file.size, file.mtime);
+      indexed++;
+    }
+    const known = this.db.prepare("SELECT path, session_id FROM files").all();
+    for (const row of known) {
+      if (seen.has(row.path)) continue;
+      if (!row.path.startsWith(dir)) continue;
+      this.db.prepare("DELETE FROM files WHERE path = ?").run(row.path);
+      this.db.prepare("DELETE FROM docs WHERE session_id = ?").run(row.session_id);
+    }
+    let stale = 0;
+    for (const file of files) {
+      const row = this.db.prepare("SELECT size, mtime FROM files WHERE path = ?").get(file.path);
+      if (!row || row.size !== file.size || row.mtime !== file.mtime) stale++;
+    }
+    return { indexed, stale };
+  }
+  indexFile(path, size, mtime) {
+    const base = path.split("/").pop() ?? path;
+    const sessionId = base.replace(/\.jsonl$/, "").split("_").pop() ?? base;
+    let raw;
+    try {
+      raw = readFileSync(path, "utf-8");
+    } catch {
+      return;
+    }
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM docs WHERE session_id = ?").run(sessionId);
+      const insert = this.db.prepare(
+        "INSERT INTO docs (text, session_id, seq, role, ts) VALUES (?, ?, ?, ?, ?)"
+      );
+      let seq = 0;
+      for (const line of raw.split("\n")) {
+        if (!line) continue;
+        if (!line.startsWith('{"type":"message"')) continue;
+        try {
+          const record = JSON.parse(line);
+          const role = record.message?.role;
+          if (role !== "user" && role !== "assistant") continue;
+          const text = messageText(record.message?.content);
+          if (!text) continue;
+          insert.run(
+            text.length > MAX_DOC_CHARS ? text.slice(0, MAX_DOC_CHARS) : text,
+            sessionId,
+            seq++,
+            role,
+            record.timestamp ?? ""
+          );
+        } catch {
+        }
+      }
+      this.db.prepare(
+        `INSERT INTO files (path, size, mtime, session_id, updated_at)
+         VALUES (?, ?, ?, ?, datetime('now'))
+         ON CONFLICT(path) DO UPDATE SET
+           size = excluded.size, mtime = excluded.mtime,
+           session_id = excluded.session_id, updated_at = datetime('now')`
+      ).run(path, size, mtime, sessionId);
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+      }
+      throw err;
+    }
+  }
+  /** Ranked matches. Queries shorter than 3 characters per term yield nothing. */
+  search(query, limit = 10) {
+    if (!this.hasFTS5) return [];
+    const terms = trigramTerms(query);
+    if (terms.length === 0) return [];
+    const ftsQuery = terms.map((t) => `"${t.replace(/"/g, '""')}"`).join(" OR ");
+    try {
+      return this.db.prepare(`
+        SELECT session_id AS sessionId, role, ts,
+               snippet(docs, 0, '\xBB', '\xAB', '\u2026', 14) AS snippet
+        FROM docs
+        WHERE docs MATCH ?
+        ORDER BY bm25(docs)
+        LIMIT ?
+      `).all(ftsQuery, limit);
+    } catch {
+      return [];
+    }
+  }
+  /** Messages of one session, oldest first. `sessionId` may be a prefix. */
+  readSession(sessionId, limit = 40) {
+    if (!this.hasFTS5) return [];
+    const file = this.db.prepare(
+      "SELECT session_id FROM files WHERE session_id LIKE ? || '%' ORDER BY updated_at DESC LIMIT 1"
+    ).get(sessionId);
+    if (!file) return [];
+    const rows = this.db.prepare(`
+      SELECT role, ts, text FROM docs
+      WHERE session_id = ?
+      ORDER BY seq DESC
+      LIMIT ?
+    `).all(file.session_id, limit);
+    return rows.reverse();
+  }
+  stats() {
+    const sessions = this.db.prepare("SELECT COUNT(*) AS c FROM files").get().c;
+    const docs = this.hasFTS5 ? this.db.prepare("SELECT COUNT(*) AS c FROM docs").get().c : 0;
+    return { sessions, docs };
+  }
+  close() {
+    this.db.close();
+  }
+};
+function messageText(content) {
+  if (typeof content === "string") return content.trim();
+  if (!Array.isArray(content)) return "";
+  const parts = [];
+  for (const block of content) {
+    if (block && typeof block === "object" && block.type === "text") {
+      const text = block.text;
+      if (typeof text === "string" && text.trim()) parts.push(text.trim());
+    }
+  }
+  return parts.join("\n");
+}
+function trigramTerms(query) {
+  const terms = /* @__PURE__ */ new Set();
+  for (const word of query.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
+    const chars = Array.from(word);
+    if (chars.length < 3) continue;
+    if (!containsCjk(word)) {
+      terms.add(word);
+      continue;
+    }
+    for (let i = 0; i + 3 <= chars.length; i++) {
+      terms.add(chars.slice(i, i + 3).join(""));
+    }
+  }
+  return [...terms];
 }
 
 // src/embedder.ts
@@ -1203,7 +1540,8 @@ These exclusions apply even if the user asks to save such things. If asked, extr
 Rules:
 - Only extract if confidence >= 0.8 (you're reasonably sure this is a lasting preference, not a one-off)
 - Key format: lowercase, dots as separators, no spaces
-- Keep values concise (under 200 chars)
+- **One claim per fact.** If a value needs "and" or "\uFF0C" to join two separate claims, split it into two keys. A fact that carries two claims cannot be updated, contradicted, or ranked independently of the other half.
+- Keep values under 120 chars \u2014 a short value is the whole point of a key. If you need a paragraph, the paragraph belongs in AGENTS.md, not here.
 - For corrections, set negative=true if it's something to AVOID
 - For validated approaches (user confirmed something works), set negative=false
 
@@ -1277,7 +1615,7 @@ function parseConsolidationResponse(text) {
     if (Array.isArray(parsed.semantic)) {
       for (const s of parsed.semantic) {
         if (typeof s.key === "string" && typeof s.value === "string" && typeof s.confidence === "number") {
-          if (s.confidence >= 0.8 && isValidKey(s.key) && s.value.length <= 500) {
+          if (s.confidence >= 0.8 && isValidKey(s.key) && s.value.length <= 200) {
             result.semantic.push({ key: s.key, value: s.value, confidence: s.confidence });
           }
         }
@@ -1299,12 +1637,12 @@ function parseConsolidationResponse(text) {
     return { semantic: [], lessons: [] };
   }
 }
-function applyExtracted(store, extracted, source = "consolidation", project) {
+function applyExtracted(store, extracted, source = "consolidation", project, sessionId) {
   let semanticCount = 0;
   let lessonCount = 0;
   for (const s of extracted.semantic) {
     if (isDerivableOrEphemeral(s.key, s.value)) continue;
-    store.setSemantic(s.key, s.value, s.confidence, "consolidation");
+    store.setSemantic(s.key, s.value, s.confidence, "consolidation", sessionId);
     semanticCount++;
   }
   for (const l of extracted.lessons) {
@@ -1371,9 +1709,10 @@ var PACKAGE_ROOT = (() => {
     return "the pi-memory package directory";
   }
 })();
-var DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
-var DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
-var GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+var DEFAULT_MEMORY_DIR = join2(homedir(), ".pi", "memory");
+var DEFAULT_DB_PATH = join2(DEFAULT_MEMORY_DIR, "memory.db");
+var GLOBAL_SETTINGS_PATH = join2(homedir(), ".pi", "agent", "settings.json");
+var SESSIONS_ROOT = join2(dirname3(GLOBAL_SETTINGS_PATH), "sessions");
 var DEFAULT_CONSOLIDATION_MODEL = "claude-sonnet-4-20250514";
 function isBusyError(err) {
   const code = err?.errcode ?? 0;
@@ -1394,8 +1733,8 @@ var PI_MEMORY_KNOWN_KEYS = ["localPath", "lessonInjection", "consolidationModel"
 var PI_TOTAL_RECALL_KNOWN_KEYS = ["localPath"];
 function resolveDbPath(cwd) {
   try {
-    const localSettingsPath = join(cwd, ".pi", "settings.json");
-    const raw = readFileSync(localSettingsPath, "utf-8");
+    const localSettingsPath = join2(cwd, ".pi", "settings.json");
+    const raw = readFileSync2(localSettingsPath, "utf-8");
     const settings = JSON.parse(raw);
     const piMemory = settings?.["pi-memory"];
     warnUnknownKeys(piMemory, "pi-memory", PI_MEMORY_KNOWN_KEYS);
@@ -1468,14 +1807,14 @@ function parseEmbeddingSettings(raw) {
 function readSettingsConfig(cwd) {
   const config = {};
   try {
-    const raw = readFileSync(GLOBAL_SETTINGS_PATH, "utf-8");
+    const raw = readFileSync2(GLOBAL_SETTINGS_PATH, "utf-8");
     const settings = JSON.parse(raw);
     mergeMemorySettings(config, settings?.memory);
   } catch {
   }
   if (cwd) {
     try {
-      const raw = readFileSync(join(cwd, ".pi", "settings.json"), "utf-8");
+      const raw = readFileSync2(join2(cwd, ".pi", "settings.json"), "utf-8");
       const settings = JSON.parse(raw);
       mergeMemorySettings(config, settings?.memory ?? settings?.["pi-memory"]);
     } catch {
@@ -1562,6 +1901,7 @@ function index_default(pi) {
       }
     }
   }
+  const EMBED_TIMEOUT_MS = 1500;
   async function searchMemory(query, limit, ctx) {
     if (!store) return [];
     const pool = Math.max(limit * 2, 20);
@@ -1570,12 +1910,14 @@ function index_default(pi) {
     if (!emb) return lexical.slice(0, limit);
     let semantic = [];
     try {
-      const vec = await emb.embed(query);
+      const vec = await emb.embed(query, AbortSignal.timeout(EMBED_TIMEOUT_MS));
       embedFailure = null;
       if (vec && vec.length > 0) {
         semantic = store.searchSemanticByVector(Float32Array.from(vec), pool);
       }
     } catch (err) {
+      const name = err?.name;
+      if (name === "TimeoutError" || name === "AbortError") return lexical.slice(0, limit);
       reportEmbedFailure(err, ctx);
       return lexical.slice(0, limit);
     }
@@ -1583,6 +1925,20 @@ function index_default(pi) {
     return reciprocalRankFusion(lexical, semantic, (e) => e.key).slice(0, limit).map((r) => r.item);
   }
   let pendingContextBlock = null;
+  let sessionIndex = null;
+  function getSessionIndex() {
+    if (sessionIndex) return sessionIndex;
+    try {
+      sessionIndex = new SessionIndex(join2(dirname3(resolvedDbPath), "sessions.db"));
+      return sessionIndex;
+    } catch (err) {
+      try {
+        cachedCtx?.ui?.notify?.(`pi-memory: session index unavailable: ${err.message}`, "warning");
+      } catch {
+      }
+      return null;
+    }
+  }
   pi.on("session_start", async (_event, ctx) => {
     try {
       sessionCwd = ctx.cwd;
@@ -1649,7 +2005,9 @@ function index_default(pi) {
   pi.on("before_agent_start", async (event, ctx) => {
     if (!store) return;
     if (injectorConfig.perTurnInjection === false) return;
-    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig, {
+      searchFacts: (query, limit) => searchMemory(query, limit, ctx)
+    });
     const mode = injectorConfig.injectionMode ?? "context-hook";
     if (mode === "system-prompt") {
       pendingContextBlock = null;
@@ -1693,6 +2051,13 @@ ${text}` };
     enqueuePendingTail();
   });
   pi.on("session_shutdown", async () => {
+    if (sessionIndex) {
+      try {
+        sessionIndex.close();
+      } catch {
+      }
+      sessionIndex = null;
+    }
     if (!store) return;
     try {
       enqueuePendingTail();
@@ -1872,7 +2237,7 @@ ${text}` };
   function applyExtraction(s, input, extracted, jobId) {
     const slug = input.cwd ? projectSlug(input.cwd) : void 0;
     s.transaction(() => {
-      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0);
+      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || void 0, input.sessionId);
       if (jobId !== null) s.deletePending(jobId);
       if (applied.semantic + applied.lessons > 0) {
         console.error(`pi-memory: consolidated ${applied.semantic} facts, ${applied.lessons} lessons`);
@@ -2029,7 +2394,54 @@ ${text}` };
       } else {
         lines.push("Search: FTS5 keyword only (set memory.embedding to enable semantic search)");
       }
+      const sessionsDb = join2(dirname3(resolvedDbPath), "sessions.db");
+      if (existsSync2(sessionsDb)) {
+        try {
+          const s = getSessionIndex()?.stats();
+          if (s) lines.push(`Sessions: ${s.sessions} transcript(s), ${s.docs} message(s) indexed for this project`);
+        } catch {
+        }
+      }
       return ok(lines.join("\n"));
+    }
+  });
+  pi.registerTool({
+    name: "session_search",
+    label: "Session Search",
+    description: "Search your own past pi sessions in this working directory, or read one. Use it to recall what was DONE \u2014 commands that worked, where a file lives, what was decided \u2014 when memory_search (distilled facts) has nothing. Query words need 3+ characters; Chinese is supported.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ description: "Words to search transcripts for (3+ characters each)" })),
+      session: Type.Optional(Type.String({ description: "Session id (or unique prefix) to read instead of searching" })),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 10 for search, 40 messages for a read)" }))
+    }),
+    async execute(_id, params, _signal, _update, _ctx) {
+      const index = getSessionIndex();
+      if (!index) return ok("Session index unavailable.");
+      const input = params;
+      const sessionArg = stripQuotes(input.session);
+      if (sessionArg) {
+        const messages = index.readSession(sessionArg, input.limit ?? 40);
+        if (messages.length === 0) return ok(`No indexed messages for session ${sessionArg}.`);
+        return ok(messages.map((m) => `[${m.ts}] ${m.role}: ${m.text}`).join("\n\n"));
+      }
+      const query = stripQuotes(input.query);
+      if (!query || !query.trim()) {
+        return ok("Pass `query` to search, or `session` to read one session.");
+      }
+      const cwd = sessionCwd ?? process.cwd();
+      const { indexed, stale } = index.sync(SESSIONS_ROOT, cwd);
+      const hits = index.search(query, input.limit ?? 10);
+      const progress = stale > 0 ? `
+
+${stale} session file(s) from this project are still indexing \u2014 call again to include them.` : "";
+      if (hits.length === 0) {
+        const why = indexed > 0 ? ` (${indexed} file(s) just indexed)` : "";
+        return ok(`No session text matches "${query}".${why}${progress}`);
+      }
+      const lines = hits.map((h) => `${h.sessionId.slice(0, 8)}  ${h.ts}  ${h.role}: ${h.snippet}`);
+      return ok(`${lines.join("\n")}
+
+Read the surrounding turn with session_search({ session: "<id>" }).${progress}`);
     }
   });
   pi.registerCommand("memory-consolidate", {

@@ -52,6 +52,7 @@ Or add to `~/.pi/agent/settings.json`:
 | `memory_forget` | Delete a fact or lesson |
 | `memory_lessons` | List learned corrections |
 | `memory_stats` | Show memory statistics |
+| `session_search` | Search this project's past session transcripts, or read one session |
 
 ## Commands
 
@@ -88,7 +89,9 @@ By default (since 1.5.0), memory is retrieved **per turn** against the current p
 - The system prompt is never modified, so its prefix cache always hits. A change in retrieved memory only misses the cache from the injection point forward.
 - The injected block is not persisted to session history and is not fed back into consolidation.
 
-Retrieval is FTS5 keyword search by default; vector matching is available as an opt-in — see [Semantic search](#semantic-search).
+Retrieval is FTS5 keyword search fused with vector matching when an embedding provider is configured — the same hybrid path `memory_search` uses, so a paraphrased or cross-language prompt still finds the fact. Without an embedder it is lexical only. Query segmentation is script-aware: latin words are matched as words, CJK runs as bigrams, because FTS5 has no CJK segmenter and would otherwise index a whole Chinese sentence as one unmatchable token.
+
+The block has a hard 8000-character budget that is enforced by **dropping whole lines**, not by cutting the finished string: every line carries a score (retrieval rank × confidence × staleness, with a boost for lessons), the cheapest lines are dropped first, and no line is ever rendered half-written. Previously the block was sliced at 8000 chars, which cut mid-line and deleted whole sections in a fixed order regardless of relevance.
 
 | Setting | Behavior |
 |---------|----------|
@@ -217,13 +220,50 @@ and nothing in the runtime dependency tree needs an install script, which a
 test enforces. If you still see the `@xenova/transformers` message, you are
 on an old version: upgrade with `pi update npm:@samfp/pi-memory` (or `pi update --extensions`).
 
+## Session search
+
+Memory records what was *learned*. `session_search` records what was *done*:
+which commands worked, where a file lives, what was decided in an earlier run.
+It indexes your own pi transcripts, so it answers "where did we set up the
+gateway" without an LLM in the loop.
+
+```
+session_search({ query: "magpie gateway key" })
+session_search({ session: "01a11459" })   // read that session's messages
+```
+
+Behaviour worth knowing:
+
+- **Derived and disposable.** The index lives in `~/.pi/memory/sessions.db`,
+  separate from the fact store. It is a pure function of the `.jsonl` files
+  under `~/.pi/agent/sessions`, so deleting it costs only a rebuild.
+- **Scoped to one working directory.** Only sessions whose `cwd` is exactly the
+  current one are indexed and searched. Another project's transcripts can never
+  surface, and a cross-project guess returns the same empty result as a
+  non-existent one.
+- **Incremental by file.** A file whose (size, mtime) is unchanged is never
+  re-read; a changed file is reinserted whole. Re-indexing is per file, not per
+  line, so a compacted or forked session costs one reinsert rather than a diff.
+- **Only message text.** `user` and `assistant` text blocks are indexed;
+  thinking blocks, tool results and bash output are not. Measured on a real
+  17 MB transcript directory: 997 messages, 445 KB of text, queries in ~1 ms.
+- **Trigram tokenizer, 3-character minimum.** This is what makes Chinese
+  searchable at all. A 2-character query returns nothing — include a third
+  character or a latin word.
+- **Bounded indexing.** At most 32 MB of transcript is read per call, newest
+  files first. The first search in a large project returns partial results and
+  says how many files are still pending; the next call continues from there.
+
 ## Storage
 
 SQLite database at `~/.pi/memory/memory.db` (WAL mode). Three tables:
 
-- `semantic` — key-value facts with confidence scores
+- `semantic` — key-value facts with confidence scores, the session each was extracted from, and the vector of its value
 - `lessons` — learned corrections with dedup
 - `events` — audit log of all memory operations
+
+A second, **disposable** database at `~/.pi/memory/sessions.db` backs
+`session_search` — see [Session search](#session-search).
 
 ### Project-local storage
 

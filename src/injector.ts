@@ -19,6 +19,39 @@ export interface ContextBlock {
 }
 
 /**
+ * Injected dependencies.
+ *
+ * `searchFacts` exists so the caller (the extension) can supply hybrid
+ * retrieval — FTS5 fused with embeddings via RRF — without the injector
+ * importing an embedding provider. The default is the store's lexical search.
+ */
+export interface InjectorDeps {
+  searchFacts?: (query: string, limit: number) => Promise<SemanticEntry[]>;
+}
+
+/** One line that competes for the context budget. */
+interface BlockItem {
+  section: string;
+  line: string;
+  /** Higher survives the budget. Only comparable within one block. */
+  score: number;
+  /** Collection order — rendering keeps it so relevance order is preserved. */
+  idx: number;
+  kind: "semantic" | "lesson";
+}
+
+/** Rendering order of the sections. Also the priority when scores tie. */
+const SECTION_ORDER = [
+  "User Preferences",
+  "Project Context",
+  "Tool Preferences",
+  "Relevant Memory",
+  "Learned Corrections",
+  "Validated Approaches",
+  "User",
+];
+
+/**
  * Configuration for lesson injection behavior.
  * - "all": inject all lessons (original behavior, default)
  * - "selective": use semantic search to pick relevant lessons + category filtering
@@ -101,28 +134,29 @@ export interface InjectorConfig {
  * Build context block. When `prompt` is provided, uses selective injection
  * (search-based). Otherwise falls back to prefix-based dump.
  */
-export async function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig): Promise<ContextBlock> {
+export async function buildContextBlock(store: MemoryStore, cwd?: string, prompt?: string, config?: InjectorConfig, deps?: InjectorDeps): Promise<ContextBlock> {
   if (prompt?.trim()) {
-    return buildSelectiveBlock(store, prompt, cwd, config);
+    return buildSelectiveBlock(store, prompt, cwd, config, deps);
   }
   return buildFallbackBlock(store, cwd);
 }
 
 // ─── Selective injection ─────────────────────────────────────────────
 
-async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig): Promise<ContextBlock> {
-  const sections: string[] = [];
-  let semanticCount = 0;
-  let lessonCount = 0;
+async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: string, config?: InjectorConfig, deps?: InjectorDeps): Promise<ContextBlock> {
+  const items: BlockItem[] = [];
   const mode = config?.lessonInjection ?? "all";
 
-  // Search semantic memory using the user's prompt
-  const results = store.searchSemantic(prompt, SEARCH_LIMIT);
+  // Search semantic memory using the user's prompt. `searchFacts` is the
+  // hybrid path; without it this degrades to lexical-only, which is why the
+  // extension always passes one.
+  const searchFacts = deps?.searchFacts ?? ((q: string, l: number) => Promise.resolve(store.searchSemantic(q, l)));
+  const results = await searchFacts(prompt, SEARCH_LIMIT);
 
   // Also search with project slug if we have a cwd, to pull in project context
   const slug = cwd ? projectSlug(cwd) : "";
   if (slug) {
-    const projectResults = store.searchSemantic(slug, 5);
+    const projectResults = await searchFacts(slug, 5);
     // Merge, dedup by key
     const seen = new Set(results.map(r => r.key));
     for (const r of projectResults) {
@@ -166,11 +200,20 @@ async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: str
     }
   }
 
-  if (filteredResults.length > 0) {
-    sections.push(formatSection("Relevant Memory", filteredResults.map(formatSemantic)));
-    semanticCount = filteredResults.length;
+  filteredResults.forEach((entry, rank) => {
+    items.push({
+      section: "Relevant Memory",
+      line: formatSemantic(entry),
+      score: factScore(entry, rank),
+      idx: items.length,
+      kind: "semantic",
+    });
+  });
 
-    // Track access time for these memories
+  if (filteredResults.length > 0) {
+    // Track access time for these memories — one write for the whole set, and
+    // the score above reads it back, so a fact that keeps proving useful
+    // survives the budget when a stale one would not.
     store.touchAccessed(filteredResults.map(r => r.key));
   }
 
@@ -179,36 +222,30 @@ async function buildSelectiveBlock(store: MemoryStore, prompt: string, cwd?: str
     ? getRelevantLessons(store, prompt, cwd)
     : store.listLessons(undefined, 50, slug || undefined);
 
-  if (lessons.length > 0) {
-    const corrections = lessons.filter(l => l.negative);
-    const positives = lessons.filter(l => !l.negative);
+  lessons.forEach((lesson, rank) => {
+    items.push({
+      section: lesson.negative ? "Learned Corrections" : "Validated Approaches",
+      line: lesson.negative
+        ? `DON'T: ${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`
+        : `${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`,
+      score: lessonScore(rank),
+      idx: items.length,
+      kind: "lesson",
+    });
+  });
 
-    if (corrections.length > 0) {
-      const formatted = corrections.map(l =>
-        `DON'T: ${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Learned Corrections", formatted));
-    }
-    if (positives.length > 0) {
-      const formatted = positives.map(l =>
-        `${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Validated Approaches", formatted));
-    }
-    lessonCount = lessons.length;
-  }
+  const user = store.listSemantic("user.", 10);
+  user.forEach((entry, rank) => {
+    items.push({
+      section: "User",
+      line: formatSemantic(entry),
+      score: factScore(entry, rank),
+      idx: items.length,
+      kind: "semantic",
+    });
+  });
 
-  if (sections.length === 0) {
-    return { text: "", stats: { semantic: 0, lessons: 0 } };
-  }
-
-  let text = `<memory>\n${sections.join("\n")}\n\n${MEMORY_DRIFT_CAVEAT}\n</memory>`;
-
-  if (text.length > MAX_CONTEXT_CHARS) {
-    text = text.slice(0, MAX_CONTEXT_CHARS - 20) + "\n... (truncated)\n</memory>";
-  }
-
-  return { text, stats: { semantic: semanticCount, lessons: lessonCount } };
+  return renderBlock(items);
 }
 
 // ─── Selective lesson injection ──────────────────────────────────────
@@ -253,76 +290,141 @@ function getRelevantLessons(store: MemoryStore, prompt: string, cwd?: string): L
 // ─── Fallback (no prompt) ────────────────────────────────────────────
 
 function buildFallbackBlock(store: MemoryStore, cwd?: string): ContextBlock {
-  const sections: string[] = [];
-  let semanticCount = 0;
-  let lessonCount = 0;
+  const items: BlockItem[] = [];
 
-  const prefs = store.listSemantic("pref.", 50);
-  if (prefs.length > 0) {
-    sections.push(formatSection("User Preferences", prefs.map(formatSemantic)));
-    semanticCount += prefs.length;
-  }
+  const push = (section: string, entries: SemanticEntry[], kind: BlockItem["kind"] = "semantic") => {
+    entries.forEach((entry, rank) => {
+      items.push({
+        section,
+        line: formatSemantic(entry),
+        score: factScore(entry, rank),
+        idx: items.length,
+        kind,
+      });
+    });
+  };
 
-  const projects = store.listSemantic("project.", 50);
+  push("User Preferences", store.listSemantic("pref.", 50));
+
   // Filter project facts to the current project only.
   // Match by exact second key segment (project.<slug>.<rest>) rather than
   // substring — avoids "pi" matching "project.pipefittingjobs.*" and prevents
   // user-set facts (confidence 0.95) from bleeding into unrelated sessions.
   const slug = cwd ? projectSlug(cwd) : "";
+  const projects = store.listSemantic("project.", 50);
   const relevant = slug
     ? projects.filter(p => {
         const parts = p.key.split(".");
         return parts.length >= 2 && parts[1] === slug;
       })
     : projects;
-  if (relevant.length > 0) {
-    sections.push(formatSection("Project Context", relevant.map(formatSemantic)));
-    semanticCount += relevant.length;
+  push("Project Context", relevant);
+
+  push("Tool Preferences", store.listSemantic("tool.", 20));
+
+  store.listLessons(undefined, 50, slug || undefined).forEach((lesson, rank) => {
+    items.push({
+      section: lesson.negative ? "Learned Corrections" : "Validated Approaches",
+      line: lesson.negative
+        ? `DON'T: ${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`
+        : `${lesson.rule}${lesson.category !== "general" ? ` [${lesson.category}]` : ""}`,
+      score: lessonScore(rank),
+      idx: items.length,
+      kind: "lesson",
+    });
+  });
+
+  push("User", store.listSemantic("user.", 10));
+
+  return renderBlock(items);
+}
+
+// ─── Budget ──────────────────────────────────────────────────────────
+
+/**
+ * How much a fact is worth when the block does not fit.
+ *
+ * Retrieval rank dominates; confidence and recency-of-use only reorder facts
+ * of comparable relevance. A fact nobody has read in 90 days loses half its
+ * score, which is what keeps a stale preference from crowding out a current
+ * one once the store outgrows `MAX_CONTEXT_CHARS`.
+ */
+function factScore(entry: SemanticEntry, rank: number): number {
+  const base = 1 / (1 + rank);
+  const confidence = 0.6 + 0.4 * entry.confidence;
+  const stale = daysSince(entry.updated_at) >= VERY_STALE_DAYS ? 0.5 : 1;
+  const usedRecently = entry.last_accessed && daysSince(entry.last_accessed) <= 7 ? 1.2 : 1;
+  return base * confidence * stale * usedRecently;
+}
+
+/**
+ * Lessons outrank facts of the same rank: a correction is the one thing this
+ * extension exists to keep, and it already survived a dedup + acceptance test.
+ */
+function lessonScore(rank: number): number {
+  return 1.25 / (1 + rank);
+}
+
+/**
+ * Render the block under a fixed budget by dropping whole lines.
+ *
+ * The previous implementation sliced the finished string at 8000 chars, which
+ * cut mid-line and deleted whole sections in a fixed order regardless of how
+ * relevant they were. Here every line carries a score, the cheapest lines are
+ * dropped first, and no line is ever split.
+ */
+function renderBlock(items: BlockItem[]): ContextBlock {
+  if (items.length === 0) return { text: "", stats: { semantic: 0, lessons: 0 } };
+
+  const overhead =
+    "<memory>\n".length +
+    "\n\n".length +
+    MEMORY_DRIFT_CAVEAT.length +
+    "\n</memory>".length;
+  let budget = MAX_CONTEXT_CHARS - overhead;
+
+  const kept = new Set<BlockItem>();
+  const sectionsStarted = new Set<string>();
+  for (const item of [...items].sort((a, b) => b.score - a.score)) {
+    const headerCost = sectionsStarted.has(item.section) ? 0 : item.section.length + 4; // "## " + "\n"
+    const cost = item.line.length + 3; // "- " + "\n"
+    // `continue`, not `break`: a short line after a long one may still fit.
+    if (cost + headerCost > budget) continue;
+    budget -= cost + headerCost;
+    sectionsStarted.add(item.section);
+    kept.add(item);
   }
 
-  const tools = store.listSemantic("tool.", 20);
-  if (tools.length > 0) {
-    sections.push(formatSection("Tool Preferences", tools.map(formatSemantic)));
-    semanticCount += tools.length;
+  if (kept.size === 0) return { text: "", stats: { semantic: 0, lessons: 0 } };
+
+  // Render in collection order so each section keeps its relevance order.
+  const bySection = new Map<string, string[]>();
+  for (const item of [...items].sort((a, b) => a.idx - b.idx)) {
+    if (!kept.has(item)) continue;
+    const lines = bySection.get(item.section) ?? [];
+    lines.push(item.line);
+    bySection.set(item.section, lines);
   }
 
-  const lessons = store.listLessons(undefined, 50, slug || undefined);
-  if (lessons.length > 0) {
-    const corrections = lessons.filter(l => l.negative);
-    const positives = lessons.filter(l => !l.negative);
-
-    if (corrections.length > 0) {
-      const formatted = corrections.map(l =>
-        `DON'T: ${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Learned Corrections", formatted));
-    }
-    if (positives.length > 0) {
-      const formatted = positives.map(l =>
-        `${l.rule}${l.category !== "general" ? ` [${l.category}]` : ""}`
-      );
-      sections.push(formatSection("Validated Approaches", formatted));
-    }
-    lessonCount = lessons.length;
+  const rendered = SECTION_ORDER
+    .filter(section => bySection.has(section))
+    .map(section => formatSection(section, bySection.get(section)!));
+  // A section added without a SECTION_ORDER entry still renders, at the end,
+  // instead of silently disappearing from the block.
+  for (const [section, lines] of bySection) {
+    if (!SECTION_ORDER.includes(section)) rendered.push(formatSection(section, lines));
   }
 
-  const user = store.listSemantic("user.", 10);
-  if (user.length > 0) {
-    sections.push(formatSection("User", user.map(formatSemantic)));
-    semanticCount += user.length;
-  }
+  const text = `<memory>\n${rendered.join("\n")}\n\n${MEMORY_DRIFT_CAVEAT}\n</memory>`;
+  const keptItems = items.filter(item => kept.has(item));
 
-  if (sections.length === 0) {
-    return { text: "", stats: { semantic: 0, lessons: 0 } };
-  }
-
-  let text = `<memory>\n${sections.join("\n")}\n\n${MEMORY_DRIFT_CAVEAT}\n</memory>`;
-
-  if (text.length > MAX_CONTEXT_CHARS) {
-    text = text.slice(0, MAX_CONTEXT_CHARS - 20) + "\n... (truncated)\n</memory>";
-  }
-
-  return { text, stats: { semantic: semanticCount, lessons: lessonCount } };
+  return {
+    text,
+    stats: {
+      semantic: keptItems.filter(item => item.kind === "semantic").length,
+      lessons: keptItems.filter(item => item.kind === "lesson").length,
+    },
+  };
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────

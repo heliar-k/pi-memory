@@ -41,6 +41,8 @@ export interface SemanticEntry {
   value: string;
   confidence: number;
   source: "user" | "consolidation" | "correction";
+  /** Session the fact was extracted from, so a wrong fact can be traced back. */
+  session_id?: string | null;
   created_at: string;
   updated_at: string;
   last_accessed?: string;
@@ -167,6 +169,12 @@ export class MemoryStore {
     // Migration: add last_accessed column if missing
     try {
       this.db.exec(`ALTER TABLE semantic ADD COLUMN last_accessed TEXT`);
+    } catch {
+      // Column already exists — ignore
+    }
+    // Migration: record which session a fact came from (provenance)
+    try {
+      this.db.exec(`ALTER TABLE semantic ADD COLUMN session_id TEXT`);
     } catch {
       // Column already exists — ignore
     }
@@ -300,21 +308,32 @@ export class MemoryStore {
     return this.db.prepare("SELECT * FROM semantic WHERE key = ?").get(normalized) as unknown as SemanticEntry | undefined;
   }
 
-  setSemantic(key: string, value: string, confidence: number = 0.8, source: SemanticEntry["source"] = "consolidation"): void {
+  setSemantic(
+    key: string,
+    value: string,
+    confidence: number = 0.8,
+    source: SemanticEntry["source"] = "consolidation",
+    sessionId?: string,
+  ): void {
     const normalized = key.toLowerCase();
     this.withLock(() => {
       const existing = this.db.prepare("SELECT * FROM semantic WHERE key = ?").get(normalized) as unknown as SemanticEntry | undefined;
       if (existing && existing.confidence > confidence) return; // higher confidence wins
 
       this.db.prepare(`
-        INSERT INTO semantic (key, value, confidence, source, updated_at)
-        VALUES (?, ?, ?, ?, datetime('now'))
+        INSERT INTO semantic (key, value, confidence, source, session_id, updated_at)
+        VALUES (?, ?, ?, ?, ?, datetime('now'))
         ON CONFLICT(key) DO UPDATE SET
           value = excluded.value,
           confidence = excluded.confidence,
           source = excluded.source,
+          session_id = COALESCE(excluded.session_id, semantic.session_id),
+          -- A changed value invalidates its vector: an embedding of the old
+          -- text would keep ranking this fact for queries it no longer
+          -- answers. NULL makes the backfill re-embed it.
+          embedding = CASE WHEN excluded.value = semantic.value THEN semantic.embedding ELSE NULL END,
           updated_at = datetime('now')
-      `).run(normalized, value, confidence, source);
+      `).run(normalized, value, confidence, source, sessionId ?? null);
 
       this.logEvent(existing ? "update" : "create", "semantic", normalized);
     });
@@ -450,18 +469,33 @@ export class MemoryStore {
       .all(limit) as unknown as SemanticEntry[];
   }
 
+  /**
+   * Search facts by relevance to a query.
+   *
+   * Two paths, chosen by the query's script:
+   *
+   * - Latin queries use FTS5 BM25.
+   * - Queries containing CJK use substring scoring over the fact table. FTS5
+   *   ships no CJK segmenter, so a run of Chinese characters is indexed as ONE
+   *   token: `术语` matches 0 rows in a store whose value contains it, and no
+   *   phrase query recovers an interior substring. Substring scoring is the
+   *   only option that needs no segmentation dependency, and the table is
+   *   small enough (thousands of rows at most) that a scan is cheaper than
+   *   the workarounds.
+   */
   searchSemantic(query: string, limit: number = 10): SemanticEntry[] {
-    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const terms = queryTerms(query);
     if (terms.length === 0) return [];
 
-    if (!this.hasFTS5) return this._searchSemanticFallback(query, limit);
+    if (terms.some(containsCjk)) return this._searchSemanticSubstring(terms, limit);
+    if (!this.hasFTS5) return this._searchSemanticSubstring(terms, limit);
 
     // Build FTS5 query — quote each term for safety
     const ftsQuery = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(" OR ");
 
     try {
       const rows = this.db.prepare(`
-        SELECT s.key, s.value, s.confidence, s.source, s.created_at, s.updated_at, s.last_accessed
+        SELECT s.key, s.value, s.confidence, s.source, s.session_id, s.created_at, s.updated_at, s.last_accessed
         FROM semantic s
         JOIN semantic_fts fts ON s.rowid = fts.rowid
         WHERE semantic_fts MATCH ?
@@ -469,40 +503,51 @@ export class MemoryStore {
         LIMIT ?
       `).all(ftsQuery, limit) as unknown as SemanticEntry[];
 
-      // FTS5 tokenizes on whitespace/punctuation, so CJK text without spaces
-      // won't match substrings (e.g. searching "小米" won't hit "查询小米").
-      // Fall back to LIKE-based substring search when FTS returns nothing.
       if (rows.length > 0) return rows;
-      return this._searchSemanticFallback(query, limit);
+      return this._searchSemanticSubstring(terms, limit);
     } catch {
       // FTS query failed — fall back to substring matching
-      return this._searchSemanticFallback(query, limit);
+      return this._searchSemanticSubstring(terms, limit);
     }
   }
 
-  private _searchSemanticFallback(query: string, limit: number): SemanticEntry[] {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return [];
-
+  private _searchSemanticSubstring(terms: string[], limit: number): SemanticEntry[] {
     const all = this.db.prepare("SELECT * FROM semantic").all() as unknown as SemanticEntry[];
-    return all
-      .map(entry => {
-        const text = `${entry.key} ${entry.value}`.toLowerCase();
-        const matches = terms.filter(t => text.includes(t)).length;
-        return { entry, score: matches / terms.length };
-      })
-      .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ entry }) => entry);
+    const scored: Array<{ entry: SemanticEntry; score: number; hits: number }> = [];
+
+    for (const entry of all) {
+      const text = `${entry.key} ${entry.value}`.toLowerCase();
+      let matched = 0;
+      let hits = 0;
+      for (const term of terms) {
+        const n = countOccurrences(text, term);
+        if (n > 0) {
+          matched++;
+          hits += n;
+        }
+      }
+      if (matched === 0) continue;
+      // Coverage first (how much of the query this fact answers), then
+      // repetition as a weak tiebreak so a fact that is *about* the term
+      // outranks one that mentions it in passing.
+      scored.push({ entry, score: matched / terms.length, hits });
+    }
+
+    scored.sort((a, b) => b.score - a.score || b.hits - a.hits);
+    return scored.slice(0, limit).map(s => s.entry);
   }
 
+  /**
+   * Record that these facts were injected. One statement for the whole set:
+   * the previous per-key loop issued a write per fact per turn, and this runs
+   * on every turn.
+   */
   touchAccessed(keys: string[]): void {
     if (keys.length === 0) return;
-    const stmt = this.db.prepare("UPDATE semantic SET last_accessed = datetime('now') WHERE key = ?");
-    for (const key of keys) {
-      stmt.run(key.toLowerCase());
-    }
+    const placeholders = keys.map(() => "?").join(",");
+    this.db.prepare(
+      `UPDATE semantic SET last_accessed = datetime('now') WHERE key IN (${placeholders})`
+    ).run(...keys.map(k => k.toLowerCase()));
   }
 
   // ─── Lessons ─────────────────────────────────────────────────────
@@ -575,14 +620,15 @@ export class MemoryStore {
   }
 
   /**
-   * Search lessons by relevance to a query. Uses FTS5 when available,
-   * falls back to substring matching. Returns lessons ranked by relevance.
+   * Search lessons by relevance to a query. Same script-based split as
+   * searchSemantic: FTS5 cannot match an interior CJK substring.
    */
   searchLessons(query: string, limit: number = 20): LessonEntry[] {
-    const terms = query.trim().split(/\s+/).filter(Boolean);
+    const terms = queryTerms(query);
     if (terms.length === 0) return [];
 
-    if (!this.hasFTS5) return this._searchLessonsFallback(query, limit);
+    if (terms.some(containsCjk)) return this._searchLessonsSubstring(terms, limit);
+    if (!this.hasFTS5) return this._searchLessonsSubstring(terms, limit);
 
     const ftsQuery = terms.map(t => `"${t.replace(/"/g, '""')}"`).join(" OR ");
 
@@ -598,29 +644,38 @@ export class MemoryStore {
 
       const mapped = rows.map(r => ({ ...r, negative: !!r.negative, project: r.project ?? null }));
 
-      // Same CJK fallback as searchSemantic — FTS won't match CJK substrings.
       if (mapped.length > 0) return mapped;
-      return this._searchLessonsFallback(query, limit);
+      return this._searchLessonsSubstring(terms, limit);
     } catch {
-      return this._searchLessonsFallback(query, limit);
+      return this._searchLessonsSubstring(terms, limit);
     }
   }
 
-  private _searchLessonsFallback(query: string, limit: number): LessonEntry[] {
-    const terms = query.toLowerCase().split(/\s+/).filter(Boolean);
-    if (terms.length === 0) return [];
-
+  private _searchLessonsSubstring(terms: string[], limit: number): LessonEntry[] {
     const all = this.db.prepare("SELECT * FROM lessons WHERE is_deleted = 0").all() as any[];
-    return all
-      .map(entry => {
-        const text = `${entry.rule} ${entry.category}`.toLowerCase();
-        const matches = terms.filter(t => text.includes(t)).length;
-        return { entry: { ...entry, negative: !!entry.negative, project: entry.project ?? null } as LessonEntry, score: matches / terms.length };
-      })
-      .filter(({ score }) => score > 0)
-      .sort((a, b) => b.score - a.score)
-      .slice(0, limit)
-      .map(({ entry }) => entry);
+    const scored: Array<{ entry: LessonEntry; score: number; hits: number }> = [];
+
+    for (const entry of all) {
+      const text = `${entry.rule} ${entry.category}`.toLowerCase();
+      let matched = 0;
+      let hits = 0;
+      for (const term of terms) {
+        const n = countOccurrences(text, term);
+        if (n > 0) {
+          matched++;
+          hits += n;
+        }
+      }
+      if (matched === 0) continue;
+      scored.push({
+        entry: { ...entry, negative: !!entry.negative, project: entry.project ?? null } as LessonEntry,
+        score: matched / terms.length,
+        hits,
+      });
+    }
+
+    scored.sort((a, b) => b.score - a.score || b.hits - a.hits);
+    return scored.slice(0, limit).map(s => s.entry);
   }
 
   deleteLesson(id: string): boolean {
@@ -783,6 +838,55 @@ export class MemoryStore {
 }
 
 // ─── Helpers ─────────────────────────────────────────────────────────
+
+/** Any CJK, Japanese kana, or Hangul codepoint. */
+const CJK_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\uac00-\ud7af]/;
+
+export function containsCjk(s: string): boolean {
+  return CJK_RE.test(s);
+}
+
+/**
+ * Split a query into searchable terms.
+ *
+ * Latin text splits on non-word characters. CJK runs split into overlapping
+ * BIGRAMS: a whole run is never matched by anything but itself (see
+ * searchSemantic), and single CJK characters are too common to rank on. So
+ * `网关 key 配置` yields `网关`, `key`, `配置`.
+ */
+export function queryTerms(query: string): string[] {
+  const terms = new Set<string>();
+
+  for (const word of query.toLowerCase().split(/[^\p{L}\p{N}_]+/u)) {
+    if (!word) continue;
+    if (!containsCjk(word)) {
+      terms.add(word);
+      continue;
+    }
+    const chars = Array.from(word);
+    if (chars.length === 1) {
+      terms.add(chars[0]!);
+      continue;
+    }
+    for (let i = 0; i < chars.length - 1; i++) terms.add(chars[i]! + chars[i + 1]!);
+  }
+
+  // Single latin characters ("a", "i") are noise; a single CJK character is a
+  // word and stays.
+  return [...terms].filter(t => t.length > 1 || containsCjk(t));
+}
+
+/** Non-overlapping occurrences of `needle` in `haystack`. */
+function countOccurrences(haystack: string, needle: string): number {
+  if (!needle) return 0;
+  let count = 0;
+  let at = haystack.indexOf(needle);
+  while (at !== -1) {
+    count++;
+    at = haystack.indexOf(needle, at + needle.length);
+  }
+  return count;
+}
 
 function jaccard(a: string, b: string): number {
   const setA = new Set(a.toLowerCase().split(/\s+/).filter(Boolean));

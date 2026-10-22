@@ -8,6 +8,14 @@ Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 
 ### Added
 
+- **`session_search`** — search your own past transcripts for the current
+  working directory, or read one session. Backed by a disposable FTS5 index
+  (`~/.pi/memory/sessions.db`) with the trigram tokenizer, incremental by file
+  (size + mtime), scoped to the exact cwd. Memory answers "what did I learn",
+  this answers "what did I do".
+- **Fact provenance** — `semantic.session_id` records the session a fact was
+  extracted from, so a wrong fact can be traced to the conversation that
+  produced it.
 - **`memory.consolidationThinking`** — thinking level for the consolidation
   subprocess (`pi --thinking`). Unset, the child inherited the global
   `defaultThinkingLevel` (xhigh in one real config) for what is a JSON
@@ -16,6 +24,29 @@ Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 
 ### Fixed
 
+- **Chinese prompts retrieved nothing.** FTS5 has no CJK segmenter, so a run of
+  Chinese characters is indexed as one token: `术语` matched 0 rows in a store
+  whose value contained it, and the substring fallback compared the *whole
+  prompt* against each fact, which also matched nothing. Every Chinese prompt
+  therefore injected only lessons, never facts. Queries are now segmented
+  script-aware (latin words, CJK bigrams) and matched by substring when the
+  query contains CJK. Same fix applied to lesson search.
+- **Per-turn injection ignored the configured embedder.** The `memory_search`
+  tool fused FTS5 with vectors; the injector called the lexical-only path, so
+  `memory.embedding` had no effect on what was injected. Injection now takes its
+  facts from the hybrid searcher, bounded by a 1.5 s timeout so a slow provider
+  costs a stalled prefix rather than a stalled turn.
+- **A fact kept the vector of its previous value.** `setSemantic` updated
+  `value` without clearing `embedding`, so a rewritten fact kept ranking for
+  queries that only the old text answered. A changed value now nulls the
+  column and the backfill re-embeds it; an unchanged value keeps it.
+- **The 8 KB cap cut mid-line and dropped whole sections by fixed order.** The
+  block is now assembled from scored lines under the budget instead: retrieval
+  rank × confidence × staleness, lessons boosted, cheapest lines dropped first,
+  no line rendered half-written.
+- **`last_accessed` was written but never read**, at one UPDATE per fact per
+  turn. It is now one statement per turn and feeds the budget score, so a fact
+  that keeps proving useful survives eviction.
 - **A queued tail could be silently dropped, and a claim could never be handed
   back.** The outbox enforced "one unclaimed job per session" with a partial
   unique index, but a drain in flight holds a claim while a new tail queues a

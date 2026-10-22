@@ -19,12 +19,13 @@
  */
 import type { ExtensionAPI, AgentToolResult, SessionEntry } from "@earendil-works/pi-coding-agent";
 import { Type, type TSchema } from "typebox";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { homedir } from "node:os";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { MemoryStore, type SemanticEntry } from "./store.js";
 import { buildContextBlock, projectSlug, CONSOLIDATION_THINKING_LEVELS, type ConsolidationThinking, type InjectorConfig } from "./injector.js";
+import { SessionIndex } from "./sessions.js";
 import {
   createEmbedder,
   diagnoseEmbedderError,
@@ -97,6 +98,8 @@ const PACKAGE_ROOT = (() => {
 const DEFAULT_MEMORY_DIR = join(homedir(), ".pi", "memory");
 const DEFAULT_DB_PATH = join(DEFAULT_MEMORY_DIR, "memory.db");
 const GLOBAL_SETTINGS_PATH = join(homedir(), ".pi", "agent", "settings.json");
+/** Where pi keeps per-cwd transcripts. Session search reads only this cwd's dir. */
+const SESSIONS_ROOT = join(dirname(GLOBAL_SETTINGS_PATH), "sessions");
 
 /**
  * Default model used for session-end consolidation when no user override is
@@ -419,6 +422,13 @@ export default function (pi: ExtensionAPI) {
   }
 
   /**
+   * Bound the embedding call. This runs inside `before_agent_start`, i.e. on
+   * the critical path of every turn — a slow provider must cost a stalled
+   * prefix, not a stalled turn.
+   */
+  const EMBED_TIMEOUT_MS = 1500;
+
+  /**
    * Search memory, fusing FTS5 lexical hits with cosine-ranked semantic hits.
    *
    * Over-fetches each path (2x limit) before fusing, because an entry ranked
@@ -436,12 +446,16 @@ export default function (pi: ExtensionAPI) {
 
     let semantic: SemanticEntry[] = [];
     try {
-      const vec = await emb.embed(query);
+      const vec = await emb.embed(query, AbortSignal.timeout(EMBED_TIMEOUT_MS));
       embedFailure = null;
       if (vec && vec.length > 0) {
         semantic = store.searchSemanticByVector(Float32Array.from(vec), pool);
       }
     } catch (err) {
+      const name = (err as Error)?.name;
+      // A timeout is a latency blip, not a broken provider: fall back quietly
+      // instead of warning the user on a slow turn.
+      if (name === "TimeoutError" || name === "AbortError") return lexical.slice(0, limit);
       reportEmbedFailure(err, ctx);
       return lexical.slice(0, limit); // lexical results are still correct
     }
@@ -456,6 +470,29 @@ export default function (pi: ExtensionAPI) {
   // LLM request by the "context" hook (context-hook injection mode). Ephemeral:
   // never persisted to session history or the consolidation queue.
   let pendingContextBlock: string | null = null;
+
+  // Derived session index (what was DONE, as opposed to what was learned).
+  // Opened on the first session_search call: most sessions never call it, and
+  // a SQLite handle is not free.
+  let sessionIndex: SessionIndex | null = null;
+
+  /**
+   * Open the derived session index on demand.
+   *
+   * Lives next to the fact store in its own file — the fact DB is not a place
+   * for hundreds of megabytes of transcript text — and is disposable:
+   * deleting it only costs a re-index.
+   */
+  function getSessionIndex(): SessionIndex | null {
+    if (sessionIndex) return sessionIndex;
+    try {
+      sessionIndex = new SessionIndex(join(dirname(resolvedDbPath), "sessions.db"));
+      return sessionIndex;
+    } catch (err: any) {
+      try { cachedCtx?.ui?.notify?.(`pi-memory: session index unavailable: ${err.message}`, "warning"); } catch { /* stale ctx */ }
+      return null;
+    }
+  }
 
   // ─── Lifecycle ───────────────────────────────────────────────────
 
@@ -598,7 +635,9 @@ export default function (pi: ExtensionAPI) {
     if (!store) return;
     if (injectorConfig.perTurnInjection === false) return;
 
-    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig);
+    const { text } = await buildContextBlock(store, ctx.cwd, event.prompt, injectorConfig, {
+      searchFacts: (query, limit) => searchMemory(query, limit, ctx),
+    });
     const mode = injectorConfig.injectionMode ?? "context-hook";
 
     if (mode === "system-prompt") {
@@ -663,6 +702,10 @@ export default function (pi: ExtensionAPI) {
   });
 
   pi.on("session_shutdown", async () => {
+    if (sessionIndex) {
+      try { sessionIndex.close(); } catch { /* nothing left to flush */ }
+      sessionIndex = null;
+    }
     if (!store) return;
     try {
       enqueuePendingTail();
@@ -921,7 +964,7 @@ export default function (pi: ExtensionAPI) {
   ): void {
     const slug = input.cwd ? projectSlug(input.cwd) : undefined;
     s.transaction(() => {
-      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined);
+      const applied = applyExtracted(s, extracted, `session:${input.sessionId ?? "unknown"}`, slug || undefined, input.sessionId);
       if (jobId !== null) s.deletePending(jobId);
       if (applied.semantic + applied.lessons > 0) {
         // Background work: log it, don't interrupt the user.
@@ -1104,7 +1147,67 @@ export default function (pi: ExtensionAPI) {
       } else {
         lines.push("Search: FTS5 keyword only (set memory.embedding to enable semantic search)");
       }
+
+      // Session search is opt-in by use: report it only once it exists on disk,
+      // otherwise every stats call advertises a feature nobody has touched.
+      const sessionsDb = join(dirname(resolvedDbPath), "sessions.db");
+      if (existsSync(sessionsDb)) {
+        try {
+          const s = getSessionIndex()?.stats();
+          if (s) lines.push(`Sessions: ${s.sessions} transcript(s), ${s.docs} message(s) indexed for this project`);
+        } catch {
+          // The session index is disposable; never fail stats over it.
+        }
+      }
+
       return ok(lines.join("\n"));
+    },
+  });
+
+  pi.registerTool({
+    name: "session_search",
+    label: "Session Search",
+    description:
+      "Search your own past pi sessions in this working directory, or read one. " +
+      "Use it to recall what was DONE — commands that worked, where a file lives, what was decided — " +
+      "when memory_search (distilled facts) has nothing. Query words need 3+ characters; Chinese is supported.",
+    parameters: Type.Object({
+      query: Type.Optional(Type.String({ description: "Words to search transcripts for (3+ characters each)" })),
+      session: Type.Optional(Type.String({ description: "Session id (or unique prefix) to read instead of searching" })),
+      limit: Type.Optional(Type.Number({ description: "Max results (default 10 for search, 40 messages for a read)" })),
+    }) as any,
+    async execute(_id, params, _signal, _update, _ctx) {
+      const index = getSessionIndex();
+      if (!index) return ok("Session index unavailable.");
+
+      const input = params as { query?: string; session?: string; limit?: number };
+      const sessionArg = stripQuotes(input.session);
+
+      if (sessionArg) {
+        const messages = index.readSession(sessionArg, input.limit ?? 40);
+        if (messages.length === 0) return ok(`No indexed messages for session ${sessionArg}.`);
+        return ok(messages.map(m => `[${m.ts}] ${m.role}: ${m.text}`).join("\n\n"));
+      }
+
+      const query = stripQuotes(input.query);
+      if (!query || !query.trim()) {
+        return ok("Pass `query` to search, or `session` to read one session.");
+      }
+
+      const cwd = sessionCwd ?? process.cwd();
+      const { indexed, stale } = index.sync(SESSIONS_ROOT, cwd);
+      const hits = index.search(query, input.limit ?? 10);
+      const progress = stale > 0
+        ? `\n\n${stale} session file(s) from this project are still indexing — call again to include them.`
+        : "";
+
+      if (hits.length === 0) {
+        const why = indexed > 0 ? ` (${indexed} file(s) just indexed)` : "";
+        return ok(`No session text matches "${query}".${why}${progress}`);
+      }
+
+      const lines = hits.map(h => `${h.sessionId.slice(0, 8)}  ${h.ts}  ${h.role}: ${h.snippet}`);
+      return ok(`${lines.join("\n")}\n\nRead the surrounding turn with session_search({ session: "<id>" }).${progress}`);
     },
   });
 

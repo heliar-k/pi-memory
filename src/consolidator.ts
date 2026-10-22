@@ -86,7 +86,8 @@ These exclusions apply even if the user asks to save such things. If asked, extr
 Rules:
 - Only extract if confidence >= 0.8 (you're reasonably sure this is a lasting preference, not a one-off)
 - Key format: lowercase, dots as separators, no spaces
-- Keep values concise (under 200 chars)
+- **One claim per fact.** If a value needs "and" or "，" to join two separate claims, split it into two keys. A fact that carries two claims cannot be updated, contradicted, or ranked independently of the other half.
+- Keep values under 120 chars — a short value is the whole point of a key. If you need a paragraph, the paragraph belongs in AGENTS.md, not here.
 - For corrections, set negative=true if it's something to AVOID
 - For validated approaches (user confirmed something works), set negative=false
 
@@ -182,7 +183,7 @@ export function parseConsolidationResponse(text: string): ExtractedMemory {
     if (Array.isArray(parsed.semantic)) {
       for (const s of parsed.semantic) {
         if (typeof s.key === "string" && typeof s.value === "string" && typeof s.confidence === "number") {
-          if (s.confidence >= 0.8 && isValidKey(s.key) && s.value.length <= 500) {
+          if (s.confidence >= 0.8 && isValidKey(s.key) && s.value.length <= 200) {
             result.semantic.push({ key: s.key, value: s.value, confidence: s.confidence });
           }
         }
@@ -210,15 +211,23 @@ export function parseConsolidationResponse(text: string): ExtractedMemory {
 /**
  * Apply extracted memory to the store, filtering out derivable/ephemeral entries.
  * Project-scoped lessons (from consolidation) are tagged with the current project slug
- * so they are only injected when working in that project.
+ * so they are only injected when working in that project. `sessionId` is stored on
+ * each fact as provenance, so a wrong fact can be traced to the conversation that
+ * produced it.
  */
-export function applyExtracted(store: MemoryStore, extracted: ExtractedMemory, source: string = "consolidation", project?: string): { semantic: number; lessons: number } {
+export function applyExtracted(
+  store: MemoryStore,
+  extracted: ExtractedMemory,
+  source: string = "consolidation",
+  project?: string,
+  sessionId?: string,
+): { semantic: number; lessons: number } {
   let semanticCount = 0;
   let lessonCount = 0;
 
   for (const s of extracted.semantic) {
     if (isDerivableOrEphemeral(s.key, s.value)) continue;
-    store.setSemantic(s.key, s.value, s.confidence, "consolidation");
+    store.setSemantic(s.key, s.value, s.confidence, "consolidation", sessionId);
     semanticCount++;
   }
 

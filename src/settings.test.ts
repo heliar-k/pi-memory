@@ -63,15 +63,20 @@ describe("readSettingsConfig", () => {
   });
 
   it("ignores non-string consolidationModel", () => {
+    // The host's global settings.json may itself set a model, which is what
+    // the invalid local value must leave untouched. Compare against that
+    // baseline rather than assuming the host has none.
+    const baseline = readSettingsConfig(tmpProject).consolidationModel;
     writeProjectSettings({ memory: { consolidationModel: 42 } });
     const cfg = readSettingsConfig(tmpProject);
-    assert.equal(cfg.consolidationModel, undefined);
+    assert.equal(cfg.consolidationModel, baseline);
   });
 
   it("ignores empty / whitespace-only consolidationModel", () => {
+    const baseline = readSettingsConfig(tmpProject).consolidationModel;
     writeProjectSettings({ memory: { consolidationModel: "   " } });
     const cfg = readSettingsConfig(tmpProject);
-    assert.equal(cfg.consolidationModel, undefined);
+    assert.equal(cfg.consolidationModel, baseline);
   });
 
   it("trims surrounding whitespace on a valid model string", () => {
@@ -133,6 +138,7 @@ describe("readSettingsConfig", () => {
   });
 
   it("a malformed consolidationModel does not clobber a valid lessonInjection", () => {
+    const baseline = readSettingsConfig(tmpProject).consolidationModel;
     writeProjectSettings({
       memory: {
         lessonInjection: "selective",
@@ -141,6 +147,6 @@ describe("readSettingsConfig", () => {
     });
     const cfg = readSettingsConfig(tmpProject);
     assert.equal(cfg.lessonInjection, "selective");
-    assert.equal(cfg.consolidationModel, undefined);
+    assert.equal(cfg.consolidationModel, baseline);
   });
 });

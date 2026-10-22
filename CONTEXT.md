@@ -35,16 +35,36 @@ Opt-in mode (`memory.lessonInjection: "selective"` in settings) that filters les
 **Bootstrap**:
 First-run operation that processes historical session summaries and extracts Facts/Lessons retroactively. Only runs when the store is empty.
 
+**Session index**:
+A disposable FTS5 database (`sessions.db`) over pi's own `.jsonl` transcripts for one cwd, backing `session_search`. It is a deterministic function of those files — no LLM, no extraction — and is reinsert-whole-file on change. "Disposable" is load-bearing: deleting it costs a rebuild, never data.
+_Avoid_: transcript cache, history store (it stores nothing that is not already on disk).
+
+**Session search**:
+The `session_search` tool. Retrieves what was *done* (commands, decisions, file locations) as opposed to what was *learned* (Facts/Lessons). Model-initiated, never injected automatically.
+_Avoid_: history recall, conversation memory.
+
+**Provenance**:
+The `session_id` stored on a Fact, naming the session **Consolidation** extracted it from. Makes a wrong Fact auditable and `memory_forget` meaningful.
+
+**Eviction**:
+How the `<memory>` block stays under its 8000-character budget: each line is scored (retrieval rank × confidence × staleness, Lessons boosted), the cheapest lines are dropped whole, and no line is ever cut. Distinct from truncation, which the block no longer does.
+
+**Script-aware segmentation**:
+Turning a query into matchable terms by script — latin words stay whole, a CJK run becomes bigrams. Exists because FTS5 has no CJK segmenter: a Chinese sentence is otherwise one unmatchable token.
+
 ## Relationships
 
 - A **Fact** has one key; a **Lesson** has no key.
 - **Consolidation** produces **Facts** and **Lessons** and writes them to the store.
 - **Injection** reads the store and builds the `<memory>` block.
+- Every **Fact** carries **Provenance**; **Session search** can read the session it points at, which is the evidence chain for a suspect Fact.
+- **Injection** shares its retrieval path with `memory_search` (hybrid lexical + vector). A **Session index** is unrelated to either — it indexes transcripts, not memory.
 - The four Fact categories are distinguished only by key prefix — no separate tables.
 
 ## Flagged ambiguities
 
 - **"Memory"** (unqualified) is overloaded — can mean the whole system, the SQLite store, or the injected `<memory>` block. Prefer the specific term.
+- **"Session search"** is not memory: it retrieves raw transcript text and learns nothing. Do not describe a Fact as "from session search".
 - **"Confidence"** belongs to Facts (set during consolidation, threshold 0.8). Lessons don't have confidence — they have a stricter acceptance test (must not duplicate existing, must be declarative).
 - **"Imperative vs declarative"** — Facts must be declarative ("Sam prefers concise responses"), not imperative ("always respond concisely"). Imperative phrasing gets re-read as a directive in later sessions and can override the user's current request. Procedures belong in skills, not memory.
 

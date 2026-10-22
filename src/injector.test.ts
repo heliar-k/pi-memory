@@ -165,3 +165,60 @@ describe("buildContextBlock", () => {
     assert.ok(stats.lessons > 0);
   });
 });
+
+describe("injected retrieval and budget", () => {
+  let store: MemoryStore;
+  let tmpDir: string;
+
+  before(() => {
+    tmpDir = mkdtempSync(join(tmpdir(), "pi-memory-budget-test-"));
+    store = new MemoryStore(join(tmpDir, "test.db"));
+  });
+
+  after(() => {
+    store.close();
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("uses the supplied searchFacts instead of the store's lexical search", async () => {
+    store.setSemantic("pref.hybrid_only", "only reachable through the injected searcher END", 0.9, "user");
+
+    let calls = 0;
+    const { text } = await buildContextBlock(store, undefined, "a prompt with no lexical overlap", {}, {
+      searchFacts: async () => {
+        calls++;
+        return [store.getSemantic("pref.hybrid_only")!];
+      },
+    });
+
+    assert.equal(calls, 1);
+    assert.ok(text.includes("hybrid_only"), "the injected searcher's results should be rendered");
+  });
+
+  it("drops whole lines to stay under budget instead of truncating mid-line", async () => {
+    // Fallback mode (no prompt) is where the budget actually binds: it lists up
+    // to 50 prefs, 50 project facts, 20 tools and 50 lessons at once, whereas
+    // per-turn retrieval only ever asks for 15.
+    store.setSemantic("user.identity", "短的事实 " + "I".repeat(20) + " END", 1.0, "user");
+    let total = 2; // identity + the hybrid_only fact from the previous test
+    for (let i = 0; i < 60; i++) {
+      // Every value ends in END, so a cut line is detectable.
+      store.setSemantic(`pref.bulk_${String(i).padStart(3, "0")}`, `filler ${i} ` + "x".repeat(150) + " END", 0.85, "user");
+      total++;
+    }
+
+    const { text, stats } = await buildContextBlock(store);
+
+    assert.ok(text.length <= 8000, `block should fit the budget, got ${text.length}`);
+    assert.ok(!text.includes("(truncated)"), "the block must not be cut mid-line");
+    assert.ok(text.includes("identity"), "the highest-scored fact should survive");
+
+    // Fact/lesson lines look like `- key: value`; the caveat's own bullets do not.
+    const rendered = text.split("\n").filter(line => /^- [^:]+: /.test(line));
+    assert.ok(rendered.length > 0);
+    assert.ok(stats.semantic < total, "some facts should be evicted");
+    for (const line of rendered) {
+      assert.ok(line.endsWith("END"), `line was cut: ${line}`);
+    }
+  });
+});
