@@ -212,7 +212,7 @@ function mergeMemorySettings(config: InjectorConfig, memorySettings: unknown): v
 
 const EMBEDDER_TYPES = ["openai", "bedrock", "ollama", "mistral", "openai-compatible"] as const;
 const EMBEDDING_KNOWN_KEYS = [
-  "type", "apiKey", "model", "baseUrl", "sendDimensions", "profile", "region", "url", "dimensions",
+  "type", "apiKey", "model", "baseUrl", "sendDimensions", "batchSize", "profile", "region", "url", "dimensions",
 ] as const;
 
 /**
@@ -241,6 +241,9 @@ function parseEmbeddingSettings(raw: unknown): InjectorConfig["embedding"] | und
   }
   if (typeof e.dimensions === "number" && Number.isFinite(e.dimensions) && e.dimensions > 0) {
     out.dimensions = e.dimensions;
+  }
+  if (typeof e.batchSize === "number" && Number.isFinite(e.batchSize) && e.batchSize >= 1) {
+    out.batchSize = Math.floor(e.batchSize);
   }
   if (typeof e.sendDimensions === "boolean") out.sendDimensions = e.sendDimensions;
   return out;

@@ -185,6 +185,11 @@ Behaviour worth knowing:
   Backfill runs there rather than at write time because the main writer is
   session-end consolidation, and a promise started during shutdown is killed
   before it resolves.
+- **Batch size is configurable.** `memory.embedding.batchSize` caps how many
+  inputs one request carries. Defaults: 100 for `openai`/`mistral`, **10 for
+  `openai-compatible`**, because gateways behind that endpoint commonly reject
+  larger batches (HTTP 400 `batch size is invalid`), which fails the whole
+  backfill. Raise it for a provider that allows more.
 - **Stale-width vectors are replaced automatically.** Stores written by v1.5.0
   and earlier hold 384-dim MiniLM vectors; a 512-dim config makes those unmatchable,
   since cosine similarity of different-length vectors is treated as 0. Backfill
@@ -209,6 +214,7 @@ once per session as a warning. Keyword search keeps working throughout.
 | **No AWS credentials / expired / access denied** (bedrock) | Check `memory.embedding.profile` and `region`, refresh the profile's credentials (for SSO: `aws sso login --profile <name>`), and make sure the model is enabled for `bedrock:InvokeModel` in that region. |
 | **No API key** (openai, mistral) | Set `memory.embedding.apiKey`, or export `OPENAI_API_KEY` / `MISTRAL_API_KEY` before starting pi. |
 | **Ollama not reachable / model missing** | `ollama serve`, then `ollama pull <model>` (default `nomic-embed-text`). Check `memory.embedding.url`. |
+| **HTTP 400 `batch size is invalid`** | The provider caps inputs per request. Lower `memory.embedding.batchSize` (the default for `openai-compatible` is 10; some gateways allow no more than that). |
 
 **Blocked install scripts are no longer a factor.** Up to v1.5.0, semantic
 search ran on `@xenova/transformers`, whose native `sharp` binding is built by

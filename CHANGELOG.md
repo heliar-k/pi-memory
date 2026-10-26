@@ -47,6 +47,13 @@ Fork-local build (`heliar-k/pi-memory@local/perf`). Not released upstream.
 - **`last_accessed` was written but never read**, at one UPDATE per fact per
   turn. It is now one statement per turn and feeds the budget score, so a fact
   that keeps proving useful survives eviction.
+- **Semantic search failed against an OpenAI-compatible gateway that caps
+  inputs per request.** The batch size was hardcoded at 100, so a provider
+  answering 400 `batch size is invalid, it should not be larger than 10` failed
+  the whole embedding backfill every session and left those entries
+  unsearchable by meaning. `memory.embedding.batchSize` now controls it, and the
+  default for `openai-compatible` dropped to 10. That 400 is also diagnosed by
+  name instead of "check the memory.embedding block".
 - **A queued tail could be silently dropped, and a claim could never be handed
   back.** The outbox enforced "one unclaimed job per session" with a partial
   unique index, but a drain in flight holds a claim while a new tail queues a

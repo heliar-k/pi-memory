@@ -33,6 +33,11 @@ export interface EmbedderConfig {
    * text-embedding-3 models do; most OpenAI-compatible providers do not.
    */
   sendDimensions?: boolean;
+  /**
+   * How many inputs one embeddings request may carry. Gateways commonly cap
+   * this (some at 10) and answer 400 above it, which fails the whole batch.
+   */
+  batchSize?: number;
   // Bedrock
   profile?: string;
   region?: string;
@@ -43,7 +48,7 @@ export interface EmbedderConfig {
 }
 
 const DEFAULTS: Record<string, Partial<EmbedderConfig>> = {
-  openai: { model: "text-embedding-3-small", dimensions: 512, baseUrl: "https://api.openai.com", sendDimensions: true },
+  openai: { model: "text-embedding-3-small", dimensions: 512, baseUrl: "https://api.openai.com", sendDimensions: true, batchSize: 100 },
   bedrock: {
     model: "amazon.titan-embed-text-v2:0",
     region: "us-east-1",
@@ -51,8 +56,10 @@ const DEFAULTS: Record<string, Partial<EmbedderConfig>> = {
     dimensions: 512,
   },
   ollama: { model: "nomic-embed-text", url: "http://localhost:11434" },
-  mistral: { model: "mistral-embed", dimensions: 1024, baseUrl: "https://api.mistral.ai", sendDimensions: false },
-  "openai-compatible": { model: "text-embedding-3-small", dimensions: 512, sendDimensions: false },
+  mistral: { model: "mistral-embed", dimensions: 1024, baseUrl: "https://api.mistral.ai", sendDimensions: false, batchSize: 100 },
+  // Gateways behind an OpenAI-compatible endpoint often limit inputs per
+  // request (10 is common), so a smaller default trades round-trips for working.
+  "openai-compatible": { model: "text-embedding-3-small", dimensions: 512, sendDimensions: false, batchSize: 10 },
 };
 
 /** Env var consulted when `apiKey` is unset, for providers that require a key. */
@@ -80,7 +87,8 @@ export function createEmbedder(config: EmbedderConfig): Embedder {
         merged.model!,
         merged.dimensions!,
         merged.baseUrl || "https://api.openai.com",
-        merged.sendDimensions ?? true
+        merged.sendDimensions ?? true,
+        merged.batchSize ?? 100
       );
     case "mistral":
       return new OpenAICompatibleEmbedder(
@@ -88,7 +96,8 @@ export function createEmbedder(config: EmbedderConfig): Embedder {
         merged.model!,
         merged.dimensions!,
         merged.baseUrl || "https://api.mistral.ai",
-        merged.sendDimensions ?? false
+        merged.sendDimensions ?? false,
+        merged.batchSize ?? 100
       );
     case "openai-compatible": {
       if (!merged.baseUrl) throw new Error("openai-compatible requires baseUrl");
@@ -97,7 +106,8 @@ export function createEmbedder(config: EmbedderConfig): Embedder {
         merged.model!,
         merged.dimensions!,
         merged.baseUrl,
-        merged.sendDimensions ?? false
+        merged.sendDimensions ?? false,
+        merged.batchSize ?? 100
       );
     }
     case "bedrock":
@@ -222,6 +232,12 @@ export function diagnoseEmbedderError(
   const http = /^(?:Embeddings API|Ollama) (\d{3})\b/.exec(message);
   if (http) {
     const status = Number(http[1]);
+    if (status === 400 && /batch size/i.test(message)) {
+      return {
+        reason: `the provider caps how many inputs one request may carry (${firstLine})`,
+        hint: `Lower memory.embedding.batchSize (currently ${cfg.batchSize}); some gateways allow at most 10.`,
+      };
+    }
     if (status === 401 || status === 403) {
       return {
         reason: `the embeddings API rejected the API key (HTTP ${status})`,
@@ -300,7 +316,8 @@ class OpenAICompatibleEmbedder implements Embedder {
     private model: string,
     private dimensions: number,
     baseUrl: string,
-    private sendDimensions: boolean
+    private sendDimensions: boolean,
+    private batchSize: number
   ) {
     this.endpoint = `${baseUrl.replace(/\/$/, "")}/v1/embeddings`;
   }
@@ -315,7 +332,7 @@ class OpenAICompatibleEmbedder implements Embedder {
     texts: string[],
     signal?: AbortSignal
   ): Promise<(number[] | null)[]> {
-    const BATCH = 100;
+    const BATCH = Math.max(1, Math.floor(this.batchSize));
     const results: (number[] | null)[] = new Array(texts.length).fill(null);
 
     for (let i = 0; i < texts.length; i += BATCH) {

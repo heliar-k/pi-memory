@@ -1,5 +1,7 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 
 import { createEmbedder, diagnoseEmbedderError } from "./embedder.js";
 
@@ -96,6 +98,17 @@ describe("diagnoseEmbedderError (#30)", () => {
     assert.match(ollama404.hint, /ollama pull nomic-embed-text/);
   });
 
+  it("points a capped-batch 400 at memory.embedding.batchSize", () => {
+    const d = diagnoseEmbedderError(
+      new Error("Embeddings API 400: Value error, batch size is invalid, it should not be larger than 10."),
+      { type: "openai-compatible", baseUrl: "http://127.0.0.1:3425" },
+      ROOT,
+    );
+    assert.match(d.reason, /caps how many inputs/);
+    assert.match(d.hint, /memory\.embedding\.batchSize/);
+    assert.match(d.hint, /10/);
+  });
+
   it("tells the user to start Ollama when it is unreachable", () => {
     const err = Object.assign(new TypeError("fetch failed"), { cause: { code: "ECONNREFUSED" } });
     const d = diagnoseEmbedderError(err, { type: "ollama" }, ROOT);
@@ -149,5 +162,39 @@ describe("createEmbedder", () => {
     // Port 9 (discard) on loopback: refused immediately, no network needed.
     const emb = createEmbedder({ type: "ollama", url: "http://127.0.0.1:9" });
     await assert.rejects(emb.embedBatch(["a", "b"]), /fetch failed/);
+  });
+});
+
+describe("OpenAI-compatible batching", () => {
+  it("splits requests by batchSize instead of failing a capped gateway", async () => {
+    const sizes: number[] = [];
+    const server = createServer((req, res) => {
+      let raw = "";
+      req.on("data", (chunk) => (raw += chunk));
+      req.on("end", () => {
+        const input = (JSON.parse(raw) as { input: string[] }).input;
+        sizes.push(input.length);
+        res.setHeader("content-type", "application/json");
+        res.end(JSON.stringify({ data: input.map((_, index) => ({ embedding: [index], index })) }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+    try {
+      const { port } = server.address() as AddressInfo;
+      const baseUrl = `http://127.0.0.1:${port}`;
+
+      // Default for openai-compatible is 10 inputs per request.
+      const dflt = createEmbedder({ type: "openai-compatible", baseUrl });
+      const texts = Array.from({ length: 11 }, (_, i) => `t${i}`);
+      assert.equal((await dflt.embedBatch(texts)).length, 11);
+      assert.deepEqual(sizes, [10, 1]);
+
+      sizes.length = 0;
+      const small = createEmbedder({ type: "openai-compatible", baseUrl, batchSize: 2 });
+      assert.equal((await small.embedBatch(["a", "b", "c"])).length, 3);
+      assert.deepEqual(sizes, [2, 1]);
+    } finally {
+      server.close();
+    }
   });
 });

@@ -1138,7 +1138,7 @@ function trigramTerms(query) {
 
 // src/embedder.ts
 var DEFAULTS = {
-  openai: { model: "text-embedding-3-small", dimensions: 512, baseUrl: "https://api.openai.com", sendDimensions: true },
+  openai: { model: "text-embedding-3-small", dimensions: 512, baseUrl: "https://api.openai.com", sendDimensions: true, batchSize: 100 },
   bedrock: {
     model: "amazon.titan-embed-text-v2:0",
     region: "us-east-1",
@@ -1146,8 +1146,10 @@ var DEFAULTS = {
     dimensions: 512
   },
   ollama: { model: "nomic-embed-text", url: "http://localhost:11434" },
-  mistral: { model: "mistral-embed", dimensions: 1024, baseUrl: "https://api.mistral.ai", sendDimensions: false },
-  "openai-compatible": { model: "text-embedding-3-small", dimensions: 512, sendDimensions: false }
+  mistral: { model: "mistral-embed", dimensions: 1024, baseUrl: "https://api.mistral.ai", sendDimensions: false, batchSize: 100 },
+  // Gateways behind an OpenAI-compatible endpoint often limit inputs per
+  // request (10 is common), so a smaller default trades round-trips for working.
+  "openai-compatible": { model: "text-embedding-3-small", dimensions: 512, sendDimensions: false, batchSize: 10 }
 };
 var API_KEY_ENV = {
   openai: "OPENAI_API_KEY",
@@ -1169,7 +1171,8 @@ function createEmbedder(config) {
         merged.model,
         merged.dimensions,
         merged.baseUrl || "https://api.openai.com",
-        merged.sendDimensions ?? true
+        merged.sendDimensions ?? true,
+        merged.batchSize ?? 100
       );
     case "mistral":
       return new OpenAICompatibleEmbedder(
@@ -1177,7 +1180,8 @@ function createEmbedder(config) {
         merged.model,
         merged.dimensions,
         merged.baseUrl || "https://api.mistral.ai",
-        merged.sendDimensions ?? false
+        merged.sendDimensions ?? false,
+        merged.batchSize ?? 100
       );
     case "openai-compatible": {
       if (!merged.baseUrl) throw new Error("openai-compatible requires baseUrl");
@@ -1186,7 +1190,8 @@ function createEmbedder(config) {
         merged.model,
         merged.dimensions,
         merged.baseUrl,
-        merged.sendDimensions ?? false
+        merged.sendDimensions ?? false,
+        merged.batchSize ?? 100
       );
     }
     case "bedrock":
@@ -1267,6 +1272,12 @@ function diagnoseEmbedderError(err, config, packageRoot) {
   const http = /^(?:Embeddings API|Ollama) (\d{3})\b/.exec(message);
   if (http) {
     const status = Number(http[1]);
+    if (status === 400 && /batch size/i.test(message)) {
+      return {
+        reason: `the provider caps how many inputs one request may carry (${firstLine})`,
+        hint: `Lower memory.embedding.batchSize (currently ${cfg.batchSize}); some gateways allow at most 10.`
+      };
+    }
     if (status === 401 || status === 403) {
       return {
         reason: `the embeddings API rejected the API key (HTTP ${status})`,
@@ -1320,17 +1331,19 @@ async function parallelMap(items, fn, concurrency, signal) {
   return results;
 }
 var OpenAICompatibleEmbedder = class {
-  constructor(apiKey, model, dimensions, baseUrl, sendDimensions) {
+  constructor(apiKey, model, dimensions, baseUrl, sendDimensions, batchSize) {
     this.apiKey = apiKey;
     this.model = model;
     this.dimensions = dimensions;
     this.sendDimensions = sendDimensions;
+    this.batchSize = batchSize;
     this.endpoint = `${baseUrl.replace(/\/$/, "")}/v1/embeddings`;
   }
   apiKey;
   model;
   dimensions;
   sendDimensions;
+  batchSize;
   endpoint;
   async embed(text, signal) {
     const [result] = await this.embedBatch([text], signal);
@@ -1338,7 +1351,7 @@ var OpenAICompatibleEmbedder = class {
     return result;
   }
   async embedBatch(texts, signal) {
-    const BATCH = 100;
+    const BATCH = Math.max(1, Math.floor(this.batchSize));
     const results = new Array(texts.length).fill(null);
     for (let i = 0; i < texts.length; i += BATCH) {
       if (signal?.aborted) throw new Error("Aborted");
@@ -1777,6 +1790,7 @@ var EMBEDDING_KNOWN_KEYS = [
   "model",
   "baseUrl",
   "sendDimensions",
+  "batchSize",
   "profile",
   "region",
   "url",
@@ -1800,6 +1814,9 @@ function parseEmbeddingSettings(raw) {
   }
   if (typeof e.dimensions === "number" && Number.isFinite(e.dimensions) && e.dimensions > 0) {
     out.dimensions = e.dimensions;
+  }
+  if (typeof e.batchSize === "number" && Number.isFinite(e.batchSize) && e.batchSize >= 1) {
+    out.batchSize = Math.floor(e.batchSize);
   }
   if (typeof e.sendDimensions === "boolean") out.sendDimensions = e.sendDimensions;
   return out;

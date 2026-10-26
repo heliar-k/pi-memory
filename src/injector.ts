@@ -76,6 +76,8 @@ export interface InjectorConfig {
     model?: string;
     baseUrl?: string;
     sendDimensions?: boolean;
+    /** Inputs per embeddings request; lower it when a gateway rejects big batches. */
+    batchSize?: number;
     profile?: string;
     region?: string;
     url?: string;
