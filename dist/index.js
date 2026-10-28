@@ -1339,11 +1339,6 @@ var OpenAICompatibleEmbedder = class {
     this.batchSize = batchSize;
     this.endpoint = `${baseUrl.replace(/\/$/, "")}/v1/embeddings`;
   }
-  apiKey;
-  model;
-  dimensions;
-  sendDimensions;
-  batchSize;
   endpoint;
   async embed(text, signal) {
     const [result] = await this.embedBatch([text], signal);
@@ -1392,10 +1387,6 @@ var BedrockEmbedder = class {
     this.model = model;
     this.dimensions = dimensions;
   }
-  profile;
-  region;
-  model;
-  dimensions;
   client = null;
   /**
    * Loaded on first use, not in the constructor. An eager import that fails
@@ -1451,8 +1442,6 @@ var OllamaEmbedder = class {
     this.model = model;
     this.url = url.replace(/\/$/, "");
   }
-  url;
-  model;
   async embed(text, signal) {
     const res = await fetch(`${this.url}/api/embed`, {
       method: "POST",
@@ -1980,16 +1969,6 @@ function index_default(pi) {
         }
       } catch {
       }
-      const stats = store.stats();
-      if (stats.semantic + stats.lessons > 0) {
-        ctx.ui.setStatus("pi-memory", `Memory: ${stats.semantic} facts, ${stats.lessons} lessons`);
-        setTimeout(() => {
-          try {
-            ctx.ui.setStatus("pi-memory", "");
-          } catch {
-          }
-        }, 5e3);
-      }
       if (injectorConfig.perTurnInjection === false) {
         try {
           const alreadyInjected = ctx.sessionManager.getEntries().some(
@@ -2087,7 +2066,7 @@ ${text}` };
   });
   pi.on("agent_settled", (_event, ctx) => {
     enqueuePendingTail();
-    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending(ctx);
+    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending();
   });
   function enqueuePendingTail() {
     if (!store || pendingTurns.length < 3) return;
@@ -2134,10 +2113,9 @@ ${text}` };
       if (last) last.assistant = text;
     }
   }
-  async function drainPending(ctx) {
+  async function drainPending() {
     if (draining) return;
     draining = true;
-    let showedStatus = false;
     try {
       for (; ; ) {
         const s = store;
@@ -2150,13 +2128,6 @@ ${text}` };
         }
         if (!job) return;
         currentJobId = job.id;
-        if (!showedStatus) {
-          showedStatus = true;
-          try {
-            ctx?.ui?.setStatus("pi-memory", "\u{1F9E0} Consolidating memory...");
-          } catch {
-          }
-        }
         let input;
         try {
           input = JSON.parse(job.payload);
@@ -2200,12 +2171,6 @@ ${text}` };
         }
       }
     } finally {
-      if (showedStatus) {
-        try {
-          ctx?.ui?.setStatus("pi-memory", "");
-        } catch {
-        }
-      }
       draining = false;
     }
   }
@@ -2484,7 +2449,7 @@ Read the surrounding turn with session_search({ session: "<id>" }).${progress}`)
           ctx.ui.notify("Consolidation already running \u2014 this tail is queued behind it", "info");
           return;
         }
-        await drainPending(ctx);
+        await drainPending();
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";
         ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons${queued}`, "info");

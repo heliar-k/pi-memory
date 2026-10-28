@@ -32,7 +32,6 @@ function createHarness(memorySettings: Record<string, unknown>) {
   const handlers = new Map<string, Handler>();
   const tools = new Map<string, Tool>();
   const notifications: { text: string; level?: string }[] = [];
-  const statuses: string[] = [];
   const sent: { customType?: string; content?: string }[] = [];
   const execCalls: unknown[][] = [];
   const exec = { code: 0 };
@@ -55,7 +54,6 @@ function createHarness(memorySettings: Record<string, unknown>) {
     mode: "tui",
     hasUI: true,
     ui: {
-      setStatus: (_key: string, value: string) => void statuses.push(value),
       notify: (text: string, level?: string) => void notifications.push({ text, level }),
     },
     sessionManager: { getBranch: () => [], getEntries: () => [] },
@@ -69,7 +67,6 @@ function createHarness(memorySettings: Record<string, unknown>) {
     project,
     handlers,
     notifications,
-    statuses,
     sent,
     execCalls,
     /** Force the consolidation subprocess to fail, or restore it. */
@@ -329,9 +326,6 @@ describe("consolidation off the interaction path", () => {
       assert.equal(h.execCalls.length, 1);
       assert.ok((h.execCalls[0]![1] as string[]).includes("test/model"));
       assert.doesNotMatch(stats, /Queued:/);
-
-      // Status is only shown while the drain runs, and always cleared.
-      assert.deepEqual(h.statuses.slice(-2), ["🧠 Consolidating memory...", ""]);
     } finally {
       await h.cleanup();
     }

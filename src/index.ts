@@ -543,17 +543,6 @@ export default function (pi: ExtensionAPI) {
         // Session may not have entries yet (brand-new session)
       }
 
-      const stats = store.stats();
-      if (stats.semantic + stats.lessons > 0) {
-        ctx.ui.setStatus("pi-memory", `Memory: ${stats.semantic} facts, ${stats.lessons} lessons`);
-        // The captured ctx may be stale by the time this fires (resume,
-        // /new, /fork, /reload). Stale-ctx access throws synchronously;
-        // swallow it — by then the new session has set its own status.
-        setTimeout(() => {
-          try { ctx.ui.setStatus("pi-memory", ""); } catch { /* ctx stale: harmless */ }
-        }, 5000);
-      }
-
       // Inject stored memory as a one-shot custom message BEFORE any user
       // message arrives. Only used when `perTurnInjection: false` is explicitly
       // configured (session_start mode, opt-out from adaptive injection).
@@ -739,7 +728,7 @@ export default function (pi: ExtensionAPI) {
     // the moment the turn finishes, so starting a multi-second child there
     // would delay the script and never finish; the queued tail is picked up by
     // the next interactive session instead.
-    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending(ctx);
+    if (ctx.mode === "tui" || ctx.mode === "rpc") void drainPending();
   });
 
   /**
@@ -817,10 +806,9 @@ export default function (pi: ExtensionAPI) {
    * retries it once the claim goes stale instead of losing it. Never throws:
    * it is called detached.
    */
-  async function drainPending(ctx: any): Promise<void> {
+  async function drainPending(): Promise<void> {
     if (draining) return;
     draining = true;
-    let showedStatus = false;
     try {
       for (;;) {
         // Bind the store per job: a session switch can replace it while the
@@ -838,11 +826,6 @@ export default function (pi: ExtensionAPI) {
         }
         if (!job) return;
         currentJobId = job.id;
-
-        if (!showedStatus) {
-          showedStatus = true;
-          try { ctx?.ui?.setStatus("pi-memory", "🧠 Consolidating memory..."); } catch { /* stale ctx */ }
-        }
 
         let input: ConsolidationInput;
         try {
@@ -888,9 +871,6 @@ export default function (pi: ExtensionAPI) {
         }
       }
     } finally {
-      if (showedStatus) {
-        try { ctx?.ui?.setStatus("pi-memory", ""); } catch { /* stale ctx */ }
-      }
       draining = false;
     }
   }
@@ -1245,7 +1225,7 @@ export default function (pi: ExtensionAPI) {
           ctx.ui.notify("Consolidation already running — this tail is queued behind it", "info");
           return;
         }
-        await drainPending(ctx);
+        await drainPending();
         const stats = store.stats();
         const queued = stats.pending > 0 ? ` (${stats.pending} still queued)` : "";
         ctx.ui.notify(`Memory updated: ${stats.semantic} facts, ${stats.lessons} lessons${queued}`, "info");

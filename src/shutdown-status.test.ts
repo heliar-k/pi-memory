@@ -33,13 +33,9 @@ function createHarness() {
 }
 
 function createSessionContext(tmpProject: string) {
-  const statuses: string[] = [];
   const ctx = {
     cwd: tmpProject,
     ui: {
-      setStatus(_key: string, value: string) {
-        statuses.push(value);
-      },
       notify() {},
     },
     sessionManager: {
@@ -52,7 +48,7 @@ function createSessionContext(tmpProject: string) {
     },
   };
 
-  return { ctx, statuses };
+  return { ctx };
 }
 
 function createTempProject() {
@@ -91,7 +87,7 @@ describe("session_shutdown", () => {
     const tmpProject = createTempProject();
     try {
       const { handlers, execCalls } = createHarness();
-      const { ctx, statuses } = createSessionContext(tmpProject);
+      const { ctx } = createSessionContext(tmpProject);
 
       await handlers.get("session_start")?.({}, ctx);
       await handlers.get("agent_end")?.(threeTurns, ctx);
@@ -99,7 +95,6 @@ describe("session_shutdown", () => {
 
       // The whole point: quitting never spawns the consolidation subprocess.
       assert.equal(execCalls.length, 0);
-      assert.ok(!statuses.includes("🧠 Consolidating memory..."));
 
       // …and nothing is lost: the tail is durable and a later drain picks it up.
       assert.equal(pendingJobs(tmpProject), 1);
@@ -112,13 +107,12 @@ describe("session_shutdown", () => {
     const tmpProject = createTempProject();
     try {
       const { handlers, execCalls } = createHarness();
-      const { ctx, statuses } = createSessionContext(tmpProject);
+      const { ctx } = createSessionContext(tmpProject);
 
       await handlers.get("session_start")?.({}, ctx);
       await handlers.get("session_shutdown")?.({}, ctx);
 
       assert.equal(execCalls.length, 0);
-      assert.ok(!statuses.includes("🧠 Consolidating memory..."));
       assert.equal(pendingJobs(tmpProject), 0);
     } finally {
       fs.rmSync(tmpProject, { recursive: true, force: true });
